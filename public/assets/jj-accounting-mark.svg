@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="JJ Accounting">
+  <defs>
+    <linearGradient id="markGradient" x1="20" x2="92" y1="12" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="#0f172a"/>
+  <path d="M31 25h27v35c0 13-8 22-22 22-6 0-12-2-16-5l7-15c2 2 5 3 8 3 4 0 6-3 6-7V41H31V25Z" fill="#ffffff"/>
+  <path d="M58 25h27v35c0 13-8 22-22 22-6 0-12-2-16-5l7-15c2 2 5 3 8 3 4 0 6-3 6-7V41H58V25Z" fill="url(#markGradient)"/>
+  <path d="M24 76h54" stroke="#14b8a6" stroke-width="5" stroke-linecap="round"/>
+</svg>

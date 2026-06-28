@@ -1,0 +1,79 @@
+{
+  "name": "jj-accounting-desktop",
+  "version": "1.0.0",
+  "description": "Offline Windows desktop accounting software for small businesses.",
+  "author": "JJ Accounting",
+  "main": "dist-electron/main/main.js",
+  "type": "module",
+  "scripts": {
+    "predev": "tsc -p tsconfig.electron.json",
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "rebuild:sqlite": "npm rebuild better-sqlite3 --runtime=electron --target=35.7.5 --dist-url=https://electronjs.org/headers",
+    "build": "tsc -p tsconfig.renderer.json && vite build && tsc -p tsconfig.electron.json && electron-builder --win nsis",
+    "build:dir": "tsc -p tsconfig.renderer.json && vite build && tsc -p tsconfig.electron.json && electron-builder --dir",
+    "typecheck": "tsc -p tsconfig.renderer.json && tsc -p tsconfig.electron.json",
+    "web": "next dev -p 3000",
+    "web:dev": "next dev -p 4000",
+    "web:build": "next build",
+    "web:start": "next start -p 3000",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "clsx": "^2.1.1",
+    "dotenv": "^17.4.2",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sonner": "^1.7.1",
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.6",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "^35.7.5",
+    "electron-builder": "^26.15.3",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.jjaccounting.desktop",
+    "productName": "JJ Accounting",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "win": {
+      "icon": "public/assets/jj-accounting-icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

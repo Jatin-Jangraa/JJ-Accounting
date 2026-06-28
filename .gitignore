@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-electron
+release
+.next
+website-data
+*.tsbuildinfo
+*.log
+.env
+license-platform
+web
