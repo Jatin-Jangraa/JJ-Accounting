@@ -39,6 +39,7 @@ import { LicenseService } from './license-service.js';
 type Db = Database.Database;
 
 const MONEY = 2;
+const DEFAULT_CLOUD_SYNC_URL = 'https://jj-accounting-cloud.vercel.app/api/sync';
 
 const round = (value: number) => Number((Number(value || 0)).toFixed(MONEY));
 const today = () => new Date().toISOString().slice(0, 10);
@@ -787,12 +788,16 @@ export class AccountingService {
 
   saveCloudSyncSettings(settings: CloudSyncSettings): CloudSyncSettings {
     const authToken = settings.authToken.trim();
+    const endpointUrl = settings.endpointUrl?.trim();
     if (settings.enabled && !authToken) throw new Error('Enter a cloud sync access key.');
+    if (endpointUrl) this.validateCloudSyncEndpoint(endpointUrl);
     const next: CloudSyncSettings = {
       enabled: Boolean(settings.enabled),
+      endpointUrl,
       authToken,
       lastSyncedAt: settings.lastSyncedAt,
-      lastSyncMessage: settings.lastSyncMessage
+      lastSyncMessage: settings.lastSyncMessage,
+      syncIntervalMinutes: settings.syncIntervalMinutes
     };
     this.writeCloudSyncSettings(next);
     // Restart timer to reflect new settings
@@ -805,7 +810,7 @@ export class AccountingService {
     if (!settings.enabled) throw new Error('Cloud sync is not enabled.');
 
     // Resolve endpoint URL: prefer env var, fallback to stored value
-    const endpointUrl = (process.env.CLOUD_SYNC_URL || settings.endpointUrl || 'https://jj-accounting-database.vercel.app/api/sync').trim();
+    const endpointUrl = this.getCloudSyncEndpoint(settings);
     if (!endpointUrl) throw new Error('Cloud sync URL is not configured. Set CLOUD_SYNC_URL in your .env file.');
     if (!settings.authToken) throw new Error('Enter a cloud sync access key.');
 
@@ -840,6 +845,9 @@ export class AccountingService {
       } catch {}
 
       if (!response.ok) {
+        if (response.status === 405) {
+          throw new Error('Cloud sync server does not accept uploads. Please contact support to verify the sync endpoint.');
+        }
         throw new Error(parsedMessage || `Cloud server returned ${response.status}.`);
       }
 
@@ -1338,6 +1346,21 @@ export class AccountingService {
     this.db.prepare('insert into settings(key,value) values(?,?) on conflict(key) do update set value=excluded.value').run(key, value);
   }
 
+  private validateCloudSyncEndpoint(endpointUrl: string) {
+    let parsed: URL;
+    try {
+      parsed = new URL(endpointUrl);
+    } catch {
+      throw new Error('Cloud sync upload URL is invalid.');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Cloud sync upload URL must start with http:// or https://.');
+    if (!parsed.pathname.endsWith('/api/sync')) throw new Error('Cloud sync upload URL must end with /api/sync.');
+  }
+
+  private getCloudSyncEndpoint(settings: CloudSyncSettings) {
+    return (process.env.CLOUD_SYNC_URL || settings.endpointUrl || DEFAULT_CLOUD_SYNC_URL).trim();
+  }
+
   private readCloudSyncSettings(): CloudSyncSettings {
     const defaults: CloudSyncSettings = { enabled: false, authToken: '' };
     if (!fs.existsSync(this.cloudSyncPath)) return defaults;
@@ -1345,6 +1368,7 @@ export class AccountingService {
       const parsed = JSON.parse(fs.readFileSync(this.cloudSyncPath, 'utf8')) as Partial<CloudSyncSettings>;
       return {
         enabled: Boolean(parsed.enabled),
+        endpointUrl: typeof parsed.endpointUrl === 'string' ? parsed.endpointUrl : undefined,
         authToken: typeof parsed.authToken === 'string' ? parsed.authToken : '',
         lastSyncedAt: typeof parsed.lastSyncedAt === 'string' ? parsed.lastSyncedAt : undefined,
         lastSyncMessage: typeof parsed.lastSyncMessage === 'string' ? parsed.lastSyncMessage : undefined,
@@ -1369,7 +1393,7 @@ export class AccountingService {
 
   private autoCloudSync() {
     const settings = this.readCloudSyncSettings();
-    const endpointUrl = (process.env.CLOUD_SYNC_URL || settings.endpointUrl || 'https://jj-accounting-database.vercel.app/api/sync').trim();
+    const endpointUrl = this.getCloudSyncEndpoint(settings);
     if (!settings.enabled || !endpointUrl || !settings.authToken || this.cloudSyncInFlight) return;
     this.cloudSyncInFlight = true;
     void this.syncDatabaseToCloud()
@@ -1386,7 +1410,7 @@ export class AccountingService {
       this.syncTimer = null;
     }
     const settings = this.readCloudSyncSettings();
-    const endpointUrl = (process.env.CLOUD_SYNC_URL || settings.endpointUrl || 'https://jj-accounting-database.vercel.app/api/sync').trim();
+    const endpointUrl = this.getCloudSyncEndpoint(settings);
     if (!settings.enabled || !endpointUrl || !settings.authToken) return;
     const intervalMs = (settings.syncIntervalMinutes ?? 30) * 60 * 1000;
     this.syncTimer = setInterval(() => {
