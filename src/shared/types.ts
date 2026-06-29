@@ -228,6 +228,27 @@ export interface BackupResult {
   message: string;
 }
 
+export interface FinancialYearArchive {
+  id: number;
+  fromFinancialYear: string;
+  toFinancialYear: string;
+  periodStart: string;
+  periodEnd: string;
+  documentPath?: string | null;
+  snapshotPath?: string | null;
+  backupPath?: string | null;
+  voucherCount: number;
+  invoiceCount: number;
+  ledgerCount: number;
+  createdAt: string;
+}
+
+export interface FinancialYearCloseResult {
+  company: Company;
+  archive: FinancialYearArchive;
+  message: string;
+}
+
 export interface CloudSyncSettings {
   enabled: boolean;
   endpointUrl?: string;

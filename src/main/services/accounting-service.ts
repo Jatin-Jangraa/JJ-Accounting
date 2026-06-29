@@ -12,6 +12,8 @@ import type {
   CloudSyncSettings,
   Company,
   DashboardSummary,
+  FinancialYearArchive,
+  FinancialYearCloseResult,
   Invoice,
   InvoiceItem,
   Item,
@@ -37,6 +39,7 @@ import type {
 import { LicenseService } from './license-service.js';
 
 type Db = Database.Database;
+type FinancialYearPeriod = { start: string; end: string };
 
 const MONEY = 2;
 const DEFAULT_CLOUD_SYNC_URL = 'https://jj-accounting-cloud.vercel.app/api/sync';
@@ -67,6 +70,7 @@ export class AccountingService {
   private db: Db;
   private dbPath: string;
   private backupDir: string;
+  private archiveDir: string;
   private cloudSyncPath: string;
   private cloudSyncInFlight = false;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -77,6 +81,8 @@ export class AccountingService {
     fs.mkdirSync(dataDir, { recursive: true });
     this.backupDir = path.join(dataDir, 'backups');
     fs.mkdirSync(this.backupDir, { recursive: true });
+    this.archiveDir = path.join(dataDir, 'financial-year-archives');
+    fs.mkdirSync(this.archiveDir, { recursive: true });
     this.cloudSyncPath = path.join(dataDir, 'cloud-sync.json');
     this.licenseService = new LicenseService(app);
     this.dbPath = path.join(dataDir, 'ledgerly.sqlite');
@@ -154,6 +160,127 @@ export class AccountingService {
     ).run(company.name, company.shopNo ?? '', company.address, company.phone, company.email, company.gstin, company.financialYear);
     this.autoBackup();
     return { ...company, id: Number(result.lastInsertRowid) };
+  }
+
+  async closeFinancialYear(company: Company): Promise<FinancialYearCloseResult> {
+    if (!company.name.trim()) throw new Error('Company name is required.');
+    const current = this.getCompany();
+    if (!current?.id) throw new Error('Save firm details before closing a financial year.');
+    const fromFinancialYear = (current.financialYear || '').trim();
+    const toFinancialYear = (company.financialYear || '').trim();
+    if (!fromFinancialYear) throw new Error('Current financial year is required before closing.');
+    if (!toFinancialYear) throw new Error('New financial year is required.');
+    if (fromFinancialYear.toLowerCase() === toFinancialYear.toLowerCase()) {
+      return { company: this.saveCompany(company), archive: this.latestFinancialYearArchive(), message: 'Firm details updated.' };
+    }
+
+    const period = this.parseFinancialYear(fromFinancialYear);
+    const nextOpeningDate = this.addDays(period.end, 1);
+    const safeYear = this.safeFileName(`${fromFinancialYear}-to-${toFinancialYear}`) || `financial-year-${Date.now()}`;
+    const yearDir = path.join(this.archiveDir, safeYear);
+    fs.mkdirSync(yearDir, { recursive: true });
+
+    const backupPath = path.join(yearDir, `${safeYear}-database.sqlite`);
+    await this.db.backup(backupPath);
+
+    const ledgers = this.listLedgers();
+    const trialBalance = this.trialBalance({ to: period.end });
+    const profitLossData = this.profitLossData(period.end, 'Combined');
+    const ledgerStatements = ledgers.map((ledger) => {
+      const closing = trialBalance.find((row) => row.ledgerId === ledger.id);
+      const openingBalance = this.ledgerOpeningSigned(ledger);
+      const rows = ledger.id ? this.ledgerStatement(ledger.id, { from: period.start, to: period.end }).map((row) => ({ ...row, balance: round(row.balance + openingBalance) })) : [];
+      return {
+        ledger,
+        openingBalance,
+        closingBalance: closing ? round(closing.debit - closing.credit) : 0,
+        rows
+      };
+    });
+    const vouchers = this.listVouchers({ from: period.start, to: period.end });
+    const invoices = this.listInvoices({ from: period.start, to: period.end });
+    const snapshot = {
+      company: current,
+      closedToCompany: { ...company, id: current.id },
+      fromFinancialYear,
+      toFinancialYear,
+      periodStart: period.start,
+      periodEnd: period.end,
+      createdAt: new Date().toISOString(),
+      trialBalance,
+      balanceSheet: trialBalance.filter((row) => ['Assets', 'Liabilities', 'Capital'].includes(row.groupName)),
+      profitLoss: profitLossData,
+      ledgers: ledgerStatements,
+      vouchers,
+      invoices
+    };
+
+    const snapshotPath = path.join(yearDir, `${safeYear}-records.json`);
+    fs.writeFileSync(snapshotPath, JSON.stringify(snapshot, null, 2));
+    const documentPath = await this.writeFinancialYearDocument(fromFinancialYear, snapshot, yearDir, safeYear);
+
+    const result = this.db.transaction(() => {
+      const inserted = this.db.prepare(
+        `insert into financial_year_archives (
+          from_financial_year, to_financial_year, period_start, period_end,
+          company_snapshot_json, trial_balance_json, balance_sheet_json, profit_loss_json, ledger_statements_json,
+          document_path, snapshot_path, backup_path, voucher_count, invoice_count, ledger_count
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        fromFinancialYear,
+        toFinancialYear,
+        period.start,
+        period.end,
+        JSON.stringify(current),
+        JSON.stringify(snapshot.trialBalance),
+        JSON.stringify(snapshot.balanceSheet),
+        JSON.stringify(snapshot.profitLoss),
+        JSON.stringify(snapshot.ledgers),
+        documentPath,
+        snapshotPath,
+        backupPath,
+        vouchers.length,
+        invoices.length,
+        ledgers.length
+      );
+      const archiveId = Number(inserted.lastInsertRowid);
+
+      this.rollForwardOpeningBalances(trialBalance, period.end, nextOpeningDate);
+
+      this.db.prepare(`update voucher_entries set financial_year_archive_id=? where financial_year_archive_id is null and voucher_id in (select id from vouchers where date <= ?)`).run(archiveId, period.end);
+      this.db.prepare(`update vouchers set financial_year_archive_id=? where financial_year_archive_id is null and date <= ?`).run(archiveId, period.end);
+      this.db.prepare(`update invoices set financial_year_archive_id=? where financial_year_archive_id is null and date <= ?`).run(archiveId, period.end);
+      this.db.prepare(`update loan_transactions set financial_year_archive_id=? where financial_year_archive_id is null and date <= ?`).run(archiveId, period.end);
+      this.db.prepare(
+        "update company set name=?, shop_no=?, address=?, phone=?, email=?, gstin=?, financial_year=?, updated_at=datetime('now') where id=?"
+      ).run(company.name, company.shopNo ?? '', company.address, company.phone, company.email, company.gstin, toFinancialYear, current.id);
+
+      return archiveId;
+    })();
+
+    const archive = this.mapFinancialYearArchive(this.db.prepare('select * from financial_year_archives where id=?').get(result) as any);
+    this.autoBackup();
+    return {
+      company: this.getCompany() as Company,
+      archive,
+      message: `Financial year ${fromFinancialYear} archived and ${toFinancialYear} opened.`
+    };
+  }
+
+  listFinancialYearArchives(): FinancialYearArchive[] {
+    return (this.db.prepare('select * from financial_year_archives order by period_end desc, id desc').all() as any[]).map((row) => this.mapFinancialYearArchive(row));
+  }
+
+  async undoFinancialYearClose(archiveId: number): Promise<BackupResult> {
+    const archive = this.db.prepare('select * from financial_year_archives where id=?').get(archiveId) as any;
+    if (!archive) throw new Error('Financial year archive not found.');
+    if (!archive.backup_path) throw new Error('This archive does not have a restore backup path.');
+    await this.restoreDatabaseFromFile(archive.backup_path, `before-financial-year-undo-${Date.now()}.sqlite`);
+    return {
+      ok: true,
+      path: archive.backup_path,
+      message: `Financial year close ${archive.from_financial_year} -> ${archive.to_financial_year} was undone.`
+    };
   }
 
   listLedgers(): Ledger[] {
@@ -376,7 +503,7 @@ export class AccountingService {
     const rows = this.db.prepare(
       `select v.date, v.voucher_no, v.type, coalesce(ve.narration, v.narration) narration, ve.debit, ve.credit
        from voucher_entries ve join vouchers v on v.id=ve.voucher_id
-       where ve.ledger_id=? and ve.balance_bd_id is null ${filters.from ? 'and v.date >= ?' : ''} ${filters.to ? 'and v.date <= ?' : ''}
+       where ve.ledger_id=? and ve.balance_bd_id is null and ve.financial_year_archive_id is null ${filters.from ? 'and v.date >= ?' : ''} ${filters.to ? 'and v.date <= ?' : ''}
        order by v.date, v.id`
     ).all(ledgerId, ...[filters.from, filters.to].filter(Boolean)) as any[];
     let balance = 0;
@@ -745,6 +872,12 @@ export class AccountingService {
     const result = await dialog.showOpenDialog({ title: 'Restore Backup', properties: ['openFile'], filters: [{ name: 'SQLite Database', extensions: ['sqlite', 'db'] }] });
     if (result.canceled || !result.filePaths[0]) return { ok: false, message: 'Restore cancelled.' };
     const source = result.filePaths[0];
+    await this.restoreDatabaseFromFile(source, `before-restore-${Date.now()}.sqlite`);
+    return { ok: true, path: source, message: 'Backup restored.' };
+  }
+
+  private assertValidBackup(source: string) {
+    if (!fs.existsSync(source)) throw new Error('The restore backup file could not be found.');
     const check = new Database(source, { readonly: true });
     try {
       const integrity = check.pragma('integrity_check', { simple: true });
@@ -753,24 +886,25 @@ export class AccountingService {
     } finally {
       check.close();
     }
+  }
 
-    const safetyCopy = path.join(this.backupDir, `before-restore-${Date.now()}.sqlite`);
+  private async restoreDatabaseFromFile(source: string, safetyFileName: string) {
+    this.assertValidBackup(source);
+    const safetyCopy = path.join(this.backupDir, safetyFileName);
     await this.db.backup(safetyCopy);
     this.db.close();
     try {
       fs.copyFileSync(source, this.dbPath);
-      this.db = new Database(this.dbPath);
-      this.db.pragma('journal_mode = WAL');
-      this.db.pragma('foreign_keys = ON');
+      this.db = this.connectDatabase();
       this.migrate();
+      this.seedSystemLedgers();
     } catch (error) {
       fs.copyFileSync(safetyCopy, this.dbPath);
-      this.db = new Database(this.dbPath);
-      this.db.pragma('journal_mode = WAL');
-      this.db.pragma('foreign_keys = ON');
+      this.db = this.connectDatabase();
+      this.migrate();
+      this.seedSystemLedgers();
       throw error;
     }
-    return { ok: true, path: source, message: 'Backup restored.' };
   }
 
   setAutoBackup(enabled: boolean): boolean {
@@ -869,7 +1003,7 @@ export class AccountingService {
     const result = await dialog.showSaveDialog({ title: 'Export Invoice PDF', defaultPath: `${invoice.invoiceNo}.pdf`, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
     if (result.canceled || !result.filePath) return { ok: false, message: 'PDF export cancelled.' };
     const { jsPDF } = await import('jspdf');
-    await import('jspdf-autotable');
+    const { autoTable } = await import('jspdf-autotable');
     const doc = new jsPDF();
     const company = this.getCompany();
     doc.setFontSize(16);
@@ -878,12 +1012,12 @@ export class AccountingService {
     doc.text(`${invoice.type} Invoice: ${invoice.invoiceNo}`, 14, 28);
     doc.text(`Date: ${invoice.date}`, 140, 28);
     doc.text(`Party: ${invoice.partyName || ''}`, 14, 36);
-    (doc as any).autoTable({
+    autoTable(doc, {
       startY: 44,
       head: [['Item', 'Qty', 'Rate', 'Disc', 'GST %', 'Total']],
       body: invoice.items.map((item) => {
         const line = this.invoiceLine(item);
-        return [item.itemName, item.qty, item.rate, item.discount, item.gstRate, line.total.toFixed(2)];
+        return [item.itemName ?? '', item.qty, item.rate, item.discount, item.gstRate, line.total.toFixed(2)];
       })
     });
     doc.text(`Grand Total: ${invoice.grandTotal?.toFixed(2)}`, 140, (doc as any).lastAutoTable.finalY + 12);
@@ -1049,10 +1183,33 @@ export class AccountingService {
         foreign key (ledger_id) references ledgers(id) on delete cascade,
         foreign key (loan_account_id) references loan_accounts(id) on delete cascade
       );
+      create table if not exists financial_year_archives (
+        id integer primary key,
+        from_financial_year text not null,
+        to_financial_year text not null,
+        period_start text not null,
+        period_end text not null,
+        company_snapshot_json text not null,
+        trial_balance_json text not null,
+        balance_sheet_json text not null,
+        profit_loss_json text not null,
+        ledger_statements_json text not null,
+        document_path text,
+        snapshot_path text,
+        backup_path text,
+        voucher_count integer not null default 0,
+        invoice_count integer not null default 0,
+        ledger_count integer not null default 0,
+        created_at text default current_timestamp
+      );
     `);
     this.addColumnIfMissing('loan_accounts', 'category', "text not null default 'Debtors'");
     this.addColumnIfMissing('voucher_entries', 'balance_bd_id', 'integer');
     this.addColumnIfMissing('loan_transactions', 'balance_bd_id', 'integer');
+    this.addColumnIfMissing('vouchers', 'financial_year_archive_id', 'integer');
+    this.addColumnIfMissing('voucher_entries', 'financial_year_archive_id', 'integer');
+    this.addColumnIfMissing('invoices', 'financial_year_archive_id', 'integer');
+    this.addColumnIfMissing('loan_transactions', 'financial_year_archive_id', 'integer');
     this.addColumnIfMissing('company', 'shop_no', "text not null default ''");
     this.addColumnIfMissing('loan_transactions', 'interest_amount', 'real not null default 0');
     this.addColumnIfMissing('loan_transactions', 'interest_ledger_id', 'integer');
@@ -1114,6 +1271,262 @@ export class AccountingService {
     ).run(name, ledgerId, 0, 'System khacha/packa account');
   }
 
+  private parseFinancialYear(financialYear: string): FinancialYearPeriod {
+    const normalized = financialYear.trim();
+    const explicitDates = normalized.match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})/);
+    if (explicitDates) return { start: explicitDates[1], end: explicitDates[2] };
+
+    const yearRange = normalized.match(/(\d{4})\D+(\d{2,4})/);
+    if (!yearRange) throw new Error('Use a financial year like 2025-2026 or 2025-26.');
+
+    const startYear = Number(yearRange[1]);
+    let endYear = Number(yearRange[2]);
+    if (endYear < 100) endYear = Math.floor(startYear / 100) * 100 + endYear;
+    if (endYear <= startYear) endYear += 100;
+    if (!Number.isFinite(startYear) || !Number.isFinite(endYear)) throw new Error('Financial year format is invalid.');
+    return { start: `${startYear}-04-01`, end: `${endYear}-03-31` };
+  }
+
+  private addDays(date: string, days: number): string {
+    const [year, month, day] = date.split('-').map(Number);
+    const value = new Date(Date.UTC(year, month - 1, day + days));
+    return value.toISOString().slice(0, 10);
+  }
+
+  private safeFileName(name: string): string {
+    return name.replace(/[^a-z0-9-_]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
+  }
+
+  private signedToBalance(value: number) {
+    const rounded = round(value);
+    return { amount: Math.abs(rounded), type: rounded < 0 ? 'Cr' : 'Dr' };
+  }
+
+  private rollForwardOpeningBalances(trialBalance: TrialBalanceRow[], periodEnd: string, nextOpeningDate: string) {
+    const netProfit = round(
+      trialBalance.filter((row) => row.groupName === 'Income').reduce((sum, row) => sum + row.credit - row.debit, 0) -
+      trialBalance.filter((row) => row.groupName === 'Expenses').reduce((sum, row) => sum + row.debit - row.credit, 0)
+    );
+    const existingRetained = this.db.prepare("select id from ledgers where name='Retained Earnings'").get() as any;
+    const retainedLedgerId = Math.abs(netProfit) >= 0.005 ? this.getOrCreateSystemLedger('Retained Earnings', 'Capital') : existingRetained?.id;
+    const loanAccounts = this.db.prepare('select * from loan_accounts').all() as any[];
+    const loanBalanceByLedger = new Map<number, { k: number; p: number; total: number }>();
+    for (const account of loanAccounts) {
+      const k = this.loanBookBalance(account, 'K', periodEnd);
+      const p = this.loanBookBalance(account, 'P', periodEnd);
+      loanBalanceByLedger.set(account.ledger_id, { k, p, total: round(k + p) });
+      const kBalance = this.signedToBalance(k);
+      const pBalance = this.signedToBalance(p);
+      this.db.prepare(
+        `update loan_accounts set opening_k_balance=?, opening_k_type=?, opening_p_balance=?, opening_p_type=?, opening_date=?, updated_at=datetime('now') where id=?`
+      ).run(kBalance.amount, kBalance.type, pBalance.amount, pBalance.type, nextOpeningDate, account.id);
+    }
+
+    const trialByLedger = new Map(trialBalance.map((row) => [row.ledgerId, row]));
+    const ledgers = this.db.prepare('select * from ledgers').all() as any[];
+    for (const ledger of ledgers) {
+      const loanBalance = loanBalanceByLedger.get(ledger.id);
+      const trial = trialByLedger.get(ledger.id);
+      let signed = trial ? round(trial.debit - trial.credit) : Number(ledger.opening_balance || 0) * (ledger.opening_type === 'Cr' ? -1 : 1);
+      if (loanBalance) signed = loanBalance.total;
+      if (!loanBalance && ['Income', 'Expenses'].includes(ledger.group_name)) signed = 0;
+      if (retainedLedgerId && ledger.id === retainedLedgerId) signed = round(signed - netProfit);
+      const next = this.signedToBalance(signed);
+      this.db.prepare("update ledgers set opening_balance=?, opening_type=?, updated_at=datetime('now') where id=?").run(next.amount, next.type, ledger.id);
+    }
+  }
+
+  private loanBookBalance(account: any, book: LoanBook, asOf: string): number {
+    const opening = book === 'K' ? Number(account.opening_k_balance || 0) : Number(account.opening_p_balance || 0);
+    const openingType = book === 'K' ? account.opening_k_type : account.opening_p_type;
+    let balance = opening * (openingType === 'Cr' ? -1 : 1);
+    const rows = this.loanRows('where t.account_id=? and t.date <= ?', [account.id, asOf]);
+    for (const row of rows) {
+      if (row.book !== book) continue;
+      balance += Number(row.amount || 0) * (row.side === 'Cr' ? -1 : 1);
+    }
+    return round(balance);
+  }
+
+  private ledgerOpeningSigned(ledger: Ledger): number {
+    const loanAccount = ledger.id ? this.db.prepare('select * from loan_accounts where ledger_id=?').get(ledger.id) as any : null;
+    if (loanAccount) {
+      const k = Number(loanAccount.opening_k_balance || 0) * (loanAccount.opening_k_type === 'Cr' ? -1 : 1);
+      const p = Number(loanAccount.opening_p_balance || 0) * (loanAccount.opening_p_type === 'Cr' ? -1 : 1);
+      return round(k + p);
+    }
+    return round(Number(ledger.openingBalance || 0) * (ledger.openingType === 'Cr' ? -1 : 1));
+  }
+
+  private latestFinancialYearArchive(): FinancialYearArchive {
+    const row = this.db.prepare('select * from financial_year_archives order by id desc limit 1').get() as any;
+    if (!row) throw new Error('No financial year archive has been created yet.');
+    return this.mapFinancialYearArchive(row);
+  }
+
+  private mapFinancialYearArchive(row: any): FinancialYearArchive {
+    return {
+      id: row.id,
+      fromFinancialYear: row.from_financial_year,
+      toFinancialYear: row.to_financial_year,
+      periodStart: row.period_start,
+      periodEnd: row.period_end,
+      documentPath: row.document_path,
+      snapshotPath: row.snapshot_path,
+      backupPath: row.backup_path,
+      voucherCount: Number(row.voucher_count || 0),
+      invoiceCount: Number(row.invoice_count || 0),
+      ledgerCount: Number(row.ledger_count || 0),
+      createdAt: row.created_at
+    };
+  }
+
+  private async writeFinancialYearDocument(archiveLabel: string, snapshot: any, yearDir: string, safeYear: string): Promise<string> {
+    const htmlPath = path.join(yearDir, `${safeYear}-report.html`);
+    const pdfPath = path.join(yearDir, `${safeYear}-report.pdf`);
+    fs.writeFileSync(htmlPath, this.financialYearHtml(snapshot));
+
+    const { jsPDF } = await import('jspdf');
+    const { autoTable } = await import('jspdf-autotable');
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+    const margin = 36;
+    const title = `${snapshot.company.name || 'Firm'} - Financial Year ${snapshot.fromFinancialYear}`;
+
+    doc.setFontSize(16);
+    doc.text(title, margin, 34);
+    doc.setFontSize(9);
+    doc.text(`Period: ${this.formatDateText(snapshot.periodStart)} to ${this.formatDateText(snapshot.periodEnd)} | Archive: ${archiveLabel}`, margin, 50);
+
+    let y = 70;
+    const section = (heading: string) => {
+      if (y > doc.internal.pageSize.getHeight() - 120) {
+        doc.addPage();
+        y = 40;
+      }
+      doc.setFontSize(12);
+      doc.text(heading, margin, y);
+      y += 12;
+    };
+    const table = (head: string[][], body: any[][]) => {
+      autoTable(doc, {
+        head,
+        body,
+        startY: y,
+        margin: { left: margin, right: margin },
+        theme: 'grid',
+        styles: { fontSize: 7, cellPadding: 3, overflow: 'linebreak' },
+        headStyles: { fillColor: [37, 99, 235] }
+      });
+      y = ((doc as any).lastAutoTable?.finalY ?? y) + 18;
+    };
+
+    section('Trial Balance');
+    table([['Account', 'Group', 'Debit', 'Credit']], snapshot.trialBalance.map((row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]));
+
+    section('Balance Sheet');
+    table([['Account', 'Group', 'Debit', 'Credit']], snapshot.balanceSheet.map((row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]));
+
+    const incomeRows = snapshot.profitLoss.incomeRows ?? [];
+    const expenseRows = snapshot.profitLoss.expenseRows ?? [];
+    const income = incomeRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.credit - row.debit, 0);
+    const expenses = expenseRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.debit - row.credit, 0);
+    section('Profit and Loss');
+    table([['Particulars', 'Amount']], [
+      ['Total Income', this.moneyText(income)],
+      ['Total Expenses', this.moneyText(expenses)],
+      [income >= expenses ? 'Net Profit' : 'Net Loss', this.moneyText(Math.abs(income - expenses))]
+    ]);
+
+    section('Ledger Index');
+    table([['Ledger', 'Group', 'Opening', 'Closing', 'Entries']], snapshot.ledgers.map((entry: any) => [entry.ledger.name, entry.ledger.groupName, this.balanceText(entry.openingBalance), this.balanceText(entry.closingBalance), String(entry.rows.length)]));
+
+    for (const entry of snapshot.ledgers) {
+      if (!entry.rows.length) continue;
+      doc.addPage();
+      y = 40;
+      doc.setFontSize(12);
+      doc.text(`Ledger: ${entry.ledger.name}`, margin, y);
+      y += 12;
+      table(
+        [['Date', 'Voucher', 'Type', 'Narration', 'Debit', 'Credit', 'Balance']],
+        [
+          ['', '', '', 'Opening Balance', '', '', this.balanceText(entry.openingBalance)],
+          ...entry.rows.map((row: LedgerStatementRow) => [
+            this.formatDateText(row.date),
+            row.voucherNo,
+            row.type,
+            row.narration,
+            this.moneyText(row.debit),
+            this.moneyText(row.credit),
+            this.moneyText(row.balance)
+          ]),
+          ['', '', '', 'Closing Balance', '', '', this.balanceText(entry.closingBalance)]
+        ]
+      );
+    }
+
+    doc.setProperties({ title, subject: 'Financial year archive', creator: 'JJ Accounting' });
+    const pdf = Buffer.from(doc.output('arraybuffer'));
+    fs.writeFileSync(pdfPath, pdf);
+    return pdfPath;
+  }
+
+  private financialYearHtml(snapshot: any): string {
+    const rows = (items: any[], cells: (item: any) => string[]) => items.map((item) => `<tr>${cells(item).map((cell) => `<td>${this.escapeHtml(cell)}</td>`).join('')}</tr>`).join('');
+    const table = (head: string[], body: string) => `<table><thead><tr>${head.map((cell) => `<th>${this.escapeHtml(cell)}</th>`).join('')}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}">No records</td></tr>`}</tbody></table>`;
+    const trialRows = rows(snapshot.trialBalance, (row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]);
+    const balanceRows = rows(snapshot.balanceSheet, (row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]);
+    const ledgerSections = snapshot.ledgers.map((entry: any) => `
+      <section>
+        <h2>${this.escapeHtml(entry.ledger.name)}</h2>
+        ${table(['Date', 'Voucher', 'Type', 'Narration', 'Debit', 'Credit', 'Balance'], `
+          <tr><td></td><td></td><td></td><td>Opening Balance</td><td></td><td></td><td>${this.escapeHtml(this.balanceText(entry.openingBalance))}</td></tr>
+          ${rows(entry.rows, (row: LedgerStatementRow) => [this.formatDateText(row.date), row.voucherNo, row.type, row.narration, this.moneyText(row.debit), this.moneyText(row.credit), this.moneyText(row.balance)])}
+          <tr><td></td><td></td><td></td><td>Closing Balance</td><td></td><td></td><td>${this.escapeHtml(this.balanceText(entry.closingBalance))}</td></tr>
+        `)}
+      </section>
+    `).join('');
+    return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>${this.escapeHtml(snapshot.company.name || 'Financial Year Archive')}</title>
+  <style>
+    body{font-family:Arial,sans-serif;color:#111;margin:32px;line-height:1.35}
+    header{border-bottom:2px solid #111;margin-bottom:24px;padding-bottom:14px}
+    h1{font-size:24px;margin:0 0 6px} h2{font-size:17px;margin:24px 0 8px}
+    .meta{font-size:12px;color:#555}
+    table{width:100%;border-collapse:collapse;margin:8px 0 18px;table-layout:fixed}
+    th,td{border:1px solid #999;padding:6px 8px;font-size:11px;text-align:left;vertical-align:top;word-wrap:break-word}
+    th{background:#eef2f7}
+    @media print{body{margin:12mm}section{break-inside:avoid}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>${this.escapeHtml(snapshot.company.name || 'Financial Year Archive')}</h1>
+    <div class="meta">Financial Year: ${this.escapeHtml(snapshot.fromFinancialYear)} | Period: ${this.formatDateText(snapshot.periodStart)} to ${this.formatDateText(snapshot.periodEnd)} | New Year: ${this.escapeHtml(snapshot.toFinancialYear)}</div>
+  </header>
+  <section><h2>Trial Balance</h2>${table(['Account', 'Group', 'Debit', 'Credit'], trialRows)}</section>
+  <section><h2>Balance Sheet</h2>${table(['Account', 'Group', 'Debit', 'Credit'], balanceRows)}</section>
+  <section><h2>Ledger Statements</h2>${ledgerSections}</section>
+</body>
+</html>`;
+  }
+
+  private moneyText(value = 0): string {
+    return round(value).toFixed(2);
+  }
+
+  private balanceText(value = 0): string {
+    const rounded = round(value);
+    return `${rounded < 0 ? 'Cr' : 'Dr'} ${Math.abs(rounded).toFixed(2)}`;
+  }
+
+  private escapeHtml(value: unknown): string {
+    return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char] as string));
+  }
+
   private validateLoanTransaction(transaction: LoanTransaction) {
     if (!transaction.accountId) throw new Error('Select an account.');
     if (!transaction.counterLedgerId) throw new Error('Select the opposite account.');
@@ -1125,7 +1538,7 @@ export class AccountingService {
   }
 
   private loanRows(whereSql: string, args: unknown[], includeArchived = false) {
-    const archiveClause = includeArchived ? '' : 't.balance_bd_id is null';
+    const archiveClause = includeArchived ? '' : 't.balance_bd_id is null and t.financial_year_archive_id is null';
     let sql = `select t.*, a.name account_name, a.default_rate account_default_rate, c.name counter_ledger_name, i.name interest_ledger_name
        from loan_transactions t
        join loan_accounts a on a.id=t.account_id
@@ -1202,7 +1615,7 @@ export class AccountingService {
         coalesce(sum(case when v.id is null then 0 else ve.credit end),0) credit_total
        from ledgers l
        left join loan_accounts la on la.ledger_id=l.id
-       left join voucher_entries ve on ve.ledger_id=l.id and ve.balance_bd_id is null
+       left join voucher_entries ve on ve.ledger_id=l.id and ve.balance_bd_id is null and ve.financial_year_archive_id is null
        left join vouchers v on v.id=ve.voucher_id ${filters.from ? 'and v.date >= @from' : ''} ${filters.to ? 'and v.date <= @to' : ''}
          and (@book is null or exists (select 1 from loan_transactions lt where lt.voucher_id=v.id and lt.book=@book))
        group by l.id
@@ -1243,6 +1656,9 @@ export class AccountingService {
   private filterSql(filters: ReportFilters, alias: string) {
     const clauses: string[] = [];
     const args: unknown[] = [];
+    if (alias === 'v' || alias === 'i') {
+      clauses.push(`${alias}.financial_year_archive_id is null`);
+    }
     if (filters.from) {
       clauses.push(`${alias}.date >= ?`);
       args.push(filters.from);

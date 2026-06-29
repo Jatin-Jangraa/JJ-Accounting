@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AlertTriangle, BarChart3, Building2, CheckCircle2, ChevronDown, Download, Eye, EyeOff, FileSpreadsheet, FileText, HardDriveDownload, HardDriveUpload, Home, KeyRound, Maximize2, Menu, Minimize2, Minus, Moon, MoreVertical, PanelLeftClose, PanelLeftOpen, Pencil, Pin, PinOff, Plus, Printer, RefreshCw, Save, Search, Settings, ShieldCheck, Shrink, Sun, Trash2, UserPlus, Users, X } from 'lucide-react';
+import { AlertTriangle, Archive, BarChart3, Building2, CheckCircle2, ChevronDown, Download, Eye, EyeOff, FileSpreadsheet, FileText, HardDriveDownload, HardDriveUpload, Home, KeyRound, Maximize2, Menu, Minimize2, Minus, Moon, MoreVertical, PanelLeftClose, PanelLeftOpen, Pencil, Pin, PinOff, Plus, Printer, RefreshCw, Save, Search, Settings, ShieldCheck, Shrink, Sun, Trash2, UserPlus, Users, X } from 'lucide-react';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { Toaster, toast } from 'sonner';
-import type { AppInit, CloudSyncSettings, Company, Ledger, LicenseStatus, LoanAccount, LoanBook, LoanSide, LoanStatementRow, LoanSummaryRow, LoanTransaction, ProfitLossData, ReportBook, TrialBalanceRow, Voucher } from '../shared/types';
+import type { AppInit, CloudSyncSettings, Company, FinancialYearArchive, Ledger, LicenseStatus, LoanAccount, LoanBook, LoanSide, LoanStatementRow, LoanSummaryRow, LoanTransaction, ProfitLossData, ReportBook, TrialBalanceRow, Voucher } from '../shared/types';
 import './styles.css';
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -1475,7 +1475,7 @@ function SettingsView({
       {tab === 'security' && <PasswordSecurityView />}
       {tab === 'backup' && <BackupView dbPath={dbPath} />}
       {tab === 'cloud' && <CloudSyncView />}
-      {tab === 'records' && <RecordsView />}
+      {tab === 'records' && <RecordsArchiveView onCompanyRestored={onCompanySaved} />}
     </div>
   );
 }
@@ -1579,6 +1579,188 @@ function RecordsView() {
   );
 }
 
+function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company: Company) => void }) {
+  const [balanceHistory, setBalanceHistory] = useState<any[]>([]);
+  const [yearArchives, setYearArchives] = useState<FinancialYearArchive[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const fetchHistory = async () => {
+    setBusy(true);
+    try {
+      const [nextBalanceHistory, nextYearArchives] = await Promise.all([
+        window.accounting.listBalanceBDHistory(),
+        window.accounting.listFinancialYearArchives()
+      ]);
+      setBalanceHistory(nextBalanceHistory);
+      setYearArchives(nextYearArchives);
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    void fetchHistory();
+  }, []);
+
+  const openDocument = async (filePath: string) => {
+    try {
+      const opened = await window.accounting.openPDFFile(filePath);
+      if (opened) toast.success('Opened saved document');
+      else toast.error('File not found or could not be opened.');
+    } catch (error: any) {
+      toast.error(error.message);
+    }
+  };
+
+  const undoYearClose = async (archive: FinancialYearArchive) => {
+    const confirmed = window.confirm(`Undo financial year close ${archive.fromFinancialYear} -> ${archive.toFinancialYear}?\n\nThis restores the database backup from before the year was shifted. Any entries added after opening ${archive.toFinancialYear} will be removed.`);
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const result = await window.accounting.undoFinancialYearClose(archive.id);
+      const restoredCompany = await window.accounting.getCompany();
+      if (restoredCompany) onCompanyRestored(restoredCompany);
+      await fetchHistory();
+      toast.success(result.message);
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="simple-panel records-panel">
+      <div className="settings-section-heading" style={{ marginBottom: '20px' }}>
+        <div className="settings-section-icon"><FileText size={22} /></div>
+        <div>
+          <h2>Records & Documents</h2>
+          <p>Browse yearly archives and historical statements saved by closing actions.</p>
+        </div>
+      </div>
+
+      {busy && balanceHistory.length === 0 && yearArchives.length === 0 ? (
+        <div style={{ padding: '20px', textAlign: 'center', color: 'var(--muted)' }}>Loading records...</div>
+      ) : (
+        <div className="records-stack">
+          <section className="records-section">
+            <div className="records-section-title">
+              <Archive size={18} />
+              <div>
+                <h3>Financial Year Archives</h3>
+                <span>Year-end reports, ledger statements, data snapshot, and database copy</span>
+              </div>
+            </div>
+            {yearArchives.length === 0 ? (
+              <div className="report-empty-state records-empty">No financial year archives yet.</div>
+            ) : (
+              <div className="plain-table-wrap">
+                <table className="plain-table">
+                  <thead>
+                    <tr>
+                      <th>Financial Year</th>
+                      <th>Period</th>
+                      <th>Records</th>
+                      <th>Saved File</th>
+                      <th className="number-cell"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {yearArchives.map((row) => (
+                      <tr key={row.id}>
+                        <td>
+                          <strong>{row.fromFinancialYear}</strong>
+                          <br />
+                          <span style={{ fontSize: '11px', color: 'var(--muted)' }}>Opened {row.toFinancialYear}</span>
+                        </td>
+                        <td>{dateText(row.periodStart)} to {dateText(row.periodEnd)}</td>
+                        <td>{row.ledgerCount} ledgers / {row.voucherCount} vouchers / {row.invoiceCount} invoices</td>
+                        <td style={{ fontSize: '11px', color: 'var(--muted)', wordBreak: 'break-all', maxWidth: '300px' }} title={row.documentPath ?? ''}>
+                          {row.documentPath ? row.documentPath.split(/[\\/]/).pop() : '-'}
+                        </td>
+                        <td className="number-cell action-cell">
+                          {row.documentPath ? (
+                            <button className="small-button icon-action" title="Open archive PDF" onClick={() => openDocument(row.documentPath!)}>
+                              <Eye size={15} />
+                            </button>
+                          ) : null}
+                          <button className="small-button icon-action danger-small" title="Undo financial year close" disabled={busy || !row.backupPath} onClick={() => undoYearClose(row)}>
+                            <RefreshCw size={15} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section className="records-section">
+            <div className="records-section-title">
+              <FileText size={18} />
+              <div>
+                <h3>Balance B/D Statements</h3>
+                <span>Individual account consolidations and saved ledger PDFs</span>
+              </div>
+            </div>
+            {balanceHistory.length === 0 ? (
+              <div className="report-empty-state records-empty">No Balance B/D records found.</div>
+            ) : (
+              <div className="plain-table-wrap">
+                <table className="plain-table">
+                  <thead>
+                    <tr>
+                      <th>Account</th>
+                      <th>Consolidation Date</th>
+                      <th>New Opening Balance</th>
+                      <th>Saved Path</th>
+                      <th className="number-cell"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {balanceHistory.map((row) => (
+                      <tr key={row.id}>
+                        <td>
+                          <strong>{row.account_name}</strong>
+                          <br />
+                          <span style={{ fontSize: '11px', color: 'var(--muted)' }}>{row.ledger_name}</span>
+                        </td>
+                        <td>{dateText(row.date)}</td>
+                        <td>
+                          <strong>{row.post_opening_type} {amount(row.post_opening_balance)}</strong>
+                          <br />
+                          <span style={{ fontSize: '11px', color: 'var(--muted)' }}>
+                            K: {row.post_k_type} {amount(row.post_k_balance)} / P: {row.post_p_type} {amount(row.post_p_balance)}
+                          </span>
+                        </td>
+                        <td style={{ fontSize: '11px', color: 'var(--muted)', wordBreak: 'break-all', maxWidth: '300px' }} title={row.pdf_path}>
+                          {row.pdf_path ? row.pdf_path.split(/[\\/]/).pop() : '-'}
+                        </td>
+                        <td className="number-cell action-cell">
+                          {row.pdf_path ? (
+                            <button className="small-button icon-action" title="Open Statement PDF" onClick={() => openDocument(row.pdf_path)}>
+                              <Eye size={15} />
+                            </button>
+                          ) : (
+                            '-'
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FirmDetailsView({ company, onSaved }: { company: Company | null; onSaved: (company: Company) => void }) {
   const [form, setForm] = useState<Company>(company ?? defaultCompany());
   const [busy, setBusy] = useState(false);
@@ -1587,11 +1769,18 @@ function FirmDetailsView({ company, onSaved }: { company: Company | null; onSave
 
   const saveFirm = async (event: React.FormEvent) => {
     event.preventDefault();
+    const previousYear = company?.financialYear?.trim();
+    const nextYear = form.financialYear.trim();
+    const isYearChange = Boolean(company?.id && previousYear && nextYear && previousYear.toLowerCase() !== nextYear.toLowerCase());
+    if (isYearChange) {
+      const confirmed = window.confirm(`Close financial year ${previousYear} and open ${nextYear}?\n\nJJ Accounting will save old-year reports, ledger statements, a JSON data snapshot, and a database backup before carrying balances forward.`);
+      if (!confirmed) return;
+    }
     setBusy(true);
     try {
-      const saved = await window.accounting.saveCompany(form);
+      const saved = isYearChange ? (await window.accounting.closeFinancialYear(form)).company : await window.accounting.saveCompany(form);
       onSaved(saved);
-      toast.success('Firm details updated');
+      toast.success(isYearChange ? 'Financial year archived and opened' : 'Firm details updated');
     } catch (error: any) {
       toast.error(error.message);
     } finally {
@@ -2149,6 +2338,7 @@ function ViewTabs({ value, onChange }: { value: ReportBook; onChange: (value: Re
 
 function ReportActions({ targetId, title }: { targetId: string; title: string }) {
   const getTarget = () => document.getElementById(targetId);
+  const textOf = (element: Element | null | undefined) => element?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
   const exportExcel = () => {
     const target = getTarget();
     if (!target) return toast.error('Report is not ready yet.');
@@ -2161,8 +2351,94 @@ function ReportActions({ targetId, title }: { targetId: string; title: string })
     URL.revokeObjectURL(url);
     toast.success('Excel file exported');
   };
+  const exportLedgerPdf = (target: HTMLElement) => {
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 34;
+    const accountName = textOf(target.querySelector('.worksheet-head h2')) || title;
+    const accountCategory = textOf(target.querySelector('.worksheet-head span'));
+    const balance = textOf(target.querySelector('.balance-pill strong'));
+    const bookLabelText = textOf(target.querySelector('.balance-pill span'));
+
+    doc.setFontSize(16);
+    doc.text(accountName, margin, 34);
+    doc.setFontSize(9);
+    doc.text([accountCategory, bookLabelText && balance ? `${bookLabelText}: ${balance}` : ''].filter(Boolean).join(' | '), margin, 50);
+    doc.setDrawColor(30, 41, 59);
+    doc.setLineWidth(0.8);
+    doc.line(margin, 58, pageWidth - margin, 58);
+
+    let startY = 78;
+    const sections = Array.from(target.querySelectorAll('.book-ledger'));
+    for (const section of sections) {
+      const sectionTitle = textOf(section.querySelector('.book-ledger-title h3')) || 'Ledger';
+      const sectionBalance = textOf(section.querySelector('.book-ledger-title span'));
+      const table = section.querySelector('table');
+      if (!table) continue;
+
+      if (startY > pageHeight - 145) {
+        doc.addPage();
+        startY = 36;
+      }
+
+      doc.setFontSize(11);
+      doc.text(`${sectionTitle}${sectionBalance ? ` - ${sectionBalance}` : ''}`, margin, startY);
+      startY += 10;
+
+      const bodyRows: any[] = Array.from(table.querySelectorAll('tbody tr')).map((row) => {
+        const cells = Array.from(row.querySelectorAll('td')).map((cell) => textOf(cell));
+        if (cells.length === 1) return [{ content: cells[0], colSpan: 8, styles: { halign: 'center', textColor: [100, 116, 139] } }];
+        return cells.slice(0, 8);
+      });
+      const footRows: any[] = Array.from(table.querySelectorAll('tfoot tr')).map((row) =>
+        Array.from(row.querySelectorAll('td')).map((cell) => {
+          const colSpan = Number(cell.getAttribute('colspan') || 1);
+          const content = textOf(cell);
+          return colSpan > 1 ? { content, colSpan } : content;
+        })
+      );
+
+      autoTable(doc, {
+        startY,
+        head: [
+          [
+            { content: 'Debit Side (Dr.)', colSpan: 4, styles: { halign: 'center', fillColor: [220, 252, 231], textColor: [22, 101, 52], fontStyle: 'bold' } },
+            { content: 'Credit Side (Cr.)', colSpan: 4, styles: { halign: 'center', fillColor: [254, 226, 226], textColor: [153, 27, 27], fontStyle: 'bold' } }
+          ],
+          ['Date', 'Particulars', 'Amount', 'Interest', 'Date', 'Particulars', 'Amount', 'Interest']
+        ],
+        body: bodyRows,
+        foot: footRows,
+        theme: 'grid',
+        margin: { left: margin, right: margin },
+        styles: { fontSize: 8, cellPadding: 4, lineColor: [71, 85, 105], lineWidth: 0.4, valign: 'middle' },
+        headStyles: { fillColor: [241, 245, 249], textColor: [15, 23, 42], fontStyle: 'bold' },
+        footStyles: { fillColor: [248, 250, 252], textColor: [15, 23, 42], fontStyle: 'bold' },
+        columnStyles: {
+          0: { cellWidth: 62 },
+          1: { cellWidth: 185 },
+          2: { cellWidth: 72, halign: 'right' },
+          3: { cellWidth: 62, halign: 'right' },
+          4: { cellWidth: 62 },
+          5: { cellWidth: 185 },
+          6: { cellWidth: 72, halign: 'right' },
+          7: { cellWidth: 62, halign: 'right' }
+        },
+        didParseCell: (data) => {
+          if ([2, 3, 6, 7].includes(data.column.index)) data.cell.styles.halign = 'right';
+          if (data.section === 'body' && data.column.index === 3) data.cell.styles.lineWidth = { top: 0.4, right: 1.2, bottom: 0.4, left: 0.4 } as any;
+        }
+      });
+      startY = ((doc as any).lastAutoTable?.finalY ?? startY) + 24;
+    }
+
+    doc.save(`${safeFileName(title)}.pdf`);
+    toast.success('Ledger PDF exported');
+  };
   const exportPdf = () => {
     const target = getTarget();
+    if (targetId === 'account-report' && target) return exportLedgerPdf(target);
     const tables = Array.from(target?.querySelectorAll('table') ?? []);
     if (!tables.length) return toast.error('There is no report table to export.');
     const doc = new jsPDF({ orientation: tables.length > 1 ? 'landscape' : 'portrait', unit: 'pt', format: 'a4' });

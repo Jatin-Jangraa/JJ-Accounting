@@ -5,6 +5,8 @@ import type {
   CloudSyncSettings,
   Company,
   DashboardSummary,
+  FinancialYearArchive,
+  FinancialYearCloseResult,
   Invoice,
   Item,
   Ledger,
@@ -29,6 +31,9 @@ export interface AccountingApi {
   changePassword(currentPassword: string, nextPassword: string): Promise<boolean>;
   getCompany(): Promise<Company | null>;
   saveCompany(company: Company): Promise<Company>;
+  closeFinancialYear(company: Company): Promise<FinancialYearCloseResult>;
+  listFinancialYearArchives(): Promise<FinancialYearArchive[]>;
+  undoFinancialYearClose(archiveId: number): Promise<BackupResult>;
   listLedgers(): Promise<Ledger[]>;
   saveLedger(ledger: Ledger): Promise<Ledger>;
   deleteLedger(id: number): Promise<boolean>;
