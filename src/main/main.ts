@@ -8,7 +8,7 @@ import { AccountingService } from './services/accounting-service.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let service: AccountingService;
-type WindowControlAction = 'close' | 'minimize' | 'enter-fullscreen' | 'exit-fullscreen' | 'toggle-fullscreen';
+type WindowControlAction = 'close' | 'minimize' | 'enter-fullscreen' | 'exit-fullscreen' | 'toggle-fullscreen' | 'focus';
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
@@ -82,6 +82,12 @@ app.whenReady().then(async () => {
       if (action === 'enter-fullscreen') sourceWindow.setFullScreen(true);
       if (action === 'exit-fullscreen') sourceWindow.setFullScreen(false);
       if (action === 'toggle-fullscreen') sourceWindow.setFullScreen(!sourceWindow.isFullScreen());
+      if (action === 'focus') {
+        if (sourceWindow.isMinimized()) sourceWindow.restore();
+        sourceWindow.show();
+        sourceWindow.focus();
+        sourceWindow.webContents.focus();
+      }
     });
     ipcMain.handle(ipcChannels.windowState, (event) => {
       const sourceWindow = BrowserWindow.fromWebContents(event.sender);

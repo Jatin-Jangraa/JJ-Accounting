@@ -1,5 +1,5 @@
 import type { App as ElectronApp } from 'electron';
-import { dialog, shell } from 'electron';
+import { BrowserWindow, dialog, shell } from 'electron';
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +30,7 @@ import type {
   LoanTransaction,
   ProfitLossData,
   ProfitLossInterestRow,
+  ReportBook,
   ReportFilters,
   SessionUser,
   TrialBalanceRow,
@@ -40,12 +41,15 @@ import { LicenseService } from './license-service.js';
 
 type Db = Database.Database;
 type FinancialYearPeriod = { start: string; end: string };
+type AccountInterestBreakdown = { previous: number; current: number; total: number };
 
 const MONEY = 2;
 const DEFAULT_CLOUD_SYNC_URL = 'https://jj-accounting-cloud.vercel.app/api/sync';
+const CLOUD_KEY_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 const round = (value: number) => Number((Number(value || 0)).toFixed(MONEY));
 const today = () => new Date().toISOString().slice(0, 10);
+const randomCloudKeyPart = (length: number) => Array.from(crypto.randomBytes(length), (byte) => CLOUD_KEY_ALPHABET[byte % CLOUD_KEY_ALPHABET.length]).join('');
 const loanCategoryGroup = (category: LoanAccountCategory): AccountGroup => {
   const normalized = category.toLowerCase();
   if (normalized.includes('creditor')) return 'Liabilities';
@@ -162,7 +166,7 @@ export class AccountingService {
     return { ...company, id: Number(result.lastInsertRowid) };
   }
 
-  async closeFinancialYear(company: Company): Promise<FinancialYearCloseResult> {
+  async closeFinancialYear(company: Company, manualCloseDate?: string): Promise<FinancialYearCloseResult> {
     if (!company.name.trim()) throw new Error('Company name is required.');
     const current = this.getCompany();
     if (!current?.id) throw new Error('Save firm details before closing a financial year.');
@@ -174,7 +178,11 @@ export class AccountingService {
       return { company: this.saveCompany(company), archive: this.latestFinancialYearArchive(), message: 'Firm details updated.' };
     }
 
-    const period = this.parseFinancialYear(fromFinancialYear);
+    const requestedCloseDate = (manualCloseDate || today()).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedCloseDate)) throw new Error('Manual close date is required.');
+    const parsedPeriod = this.parseFinancialYear(fromFinancialYear);
+    const period = { ...parsedPeriod, end: requestedCloseDate };
+    if (period.end < period.start) throw new Error('Manual close date cannot be before the current financial year start date.');
     const nextOpeningDate = this.addDays(period.end, 1);
     const safeYear = this.safeFileName(`${fromFinancialYear}-to-${toFinancialYear}`) || `financial-year-${Date.now()}`;
     const yearDir = path.join(this.archiveDir, safeYear);
@@ -184,19 +192,16 @@ export class AccountingService {
     await this.db.backup(backupPath);
 
     const ledgers = this.listLedgers();
-    const trialBalance = this.trialBalance({ to: period.end });
-    const profitLossData = this.profitLossData(period.end, 'Combined');
-    const ledgerStatements = ledgers.map((ledger) => {
-      const closing = trialBalance.find((row) => row.ledgerId === ledger.id);
-      const openingBalance = this.ledgerOpeningSigned(ledger);
-      const rows = ledger.id ? this.ledgerStatement(ledger.id, { from: period.start, to: period.end }).map((row) => ({ ...row, balance: round(row.balance + openingBalance) })) : [];
-      return {
-        ledger,
-        openingBalance,
-        closingBalance: closing ? round(closing.debit - closing.credit) : 0,
-        rows
-      };
-    });
+    const previousInterestBeforeClose = this.loanPreviousInterestSnapshot();
+    const bookReports = {
+      Combined: this.financialYearBookReport('Combined', ledgers, period),
+      K: this.financialYearBookReport('K', ledgers, period),
+      P: this.financialYearBookReport('P', ledgers, period)
+    };
+    const previousInterestAfterClose = this.loanPreviousInterestSnapshot(period.end);
+    const trialBalance = bookReports.Combined.trialBalance;
+    const profitLossData = bookReports.Combined.profitLoss;
+    const ledgerStatements = bookReports.Combined.ledgers;
     const vouchers = this.listVouchers({ from: period.start, to: period.end });
     const invoices = this.listInvoices({ from: period.start, to: period.end });
     const snapshot = {
@@ -211,6 +216,9 @@ export class AccountingService {
       balanceSheet: trialBalance.filter((row) => ['Assets', 'Liabilities', 'Capital'].includes(row.groupName)),
       profitLoss: profitLossData,
       ledgers: ledgerStatements,
+      bookReports,
+      previousInterestBeforeClose,
+      previousInterestAfterClose,
       vouchers,
       invoices
     };
@@ -224,8 +232,8 @@ export class AccountingService {
         `insert into financial_year_archives (
           from_financial_year, to_financial_year, period_start, period_end,
           company_snapshot_json, trial_balance_json, balance_sheet_json, profit_loss_json, ledger_statements_json,
-          document_path, snapshot_path, backup_path, voucher_count, invoice_count, ledger_count
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          document_path, snapshot_path, backup_path, voucher_count, invoice_count, ledger_count, previous_interest_json
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         fromFinancialYear,
         toFinancialYear,
@@ -241,10 +249,12 @@ export class AccountingService {
         backupPath,
         vouchers.length,
         invoices.length,
-        ledgers.length
+        ledgers.length,
+        JSON.stringify(previousInterestAfterClose)
       );
       const archiveId = Number(inserted.lastInsertRowid);
 
+      this.storePreviousYearInterest(period.end, nextOpeningDate);
       this.rollForwardOpeningBalances(trialBalance, period.end, nextOpeningDate);
 
       this.db.prepare(`update voucher_entries set financial_year_archive_id=? where financial_year_archive_id is null and voucher_id in (select id from vouchers where date <= ?)`).run(archiveId, period.end);
@@ -254,6 +264,15 @@ export class AccountingService {
       this.db.prepare(
         "update company set name=?, shop_no=?, address=?, phone=?, email=?, gstin=?, financial_year=?, updated_at=datetime('now') where id=?"
       ).run(company.name, company.shopNo ?? '', company.address, company.phone, company.email, company.gstin, toFinancialYear, current.id);
+      this.writeAuditLog('financial_year', archiveId, 'close', {
+        fromFinancialYear,
+        toFinancialYear,
+        periodStart: period.start,
+        periodEnd: period.end,
+        nextOpeningDate,
+        previousInterestBeforeClose,
+        previousInterestAfterClose
+      });
 
       return archiveId;
     })();
@@ -263,7 +282,7 @@ export class AccountingService {
     return {
       company: this.getCompany() as Company,
       archive,
-      message: `Financial year ${fromFinancialYear} archived and ${toFinancialYear} opened.`
+      message: `Financial year ${fromFinancialYear} manually closed on ${period.end}; ${toFinancialYear} opened from ${nextOpeningDate}.`
     };
   }
 
@@ -275,7 +294,18 @@ export class AccountingService {
     const archive = this.db.prepare('select * from financial_year_archives where id=?').get(archiveId) as any;
     if (!archive) throw new Error('Financial year archive not found.');
     if (!archive.backup_path) throw new Error('This archive does not have a restore backup path.');
+    const nextOpeningDate = this.addDays(archive.period_end, 1);
+    if (this.hasTransactionsOnOrAfter(nextOpeningDate)) {
+      throw new Error('Undo is not allowed because transactions already exist in the new financial year. Please delete or reverse those entries first.');
+    }
     await this.restoreDatabaseFromFile(archive.backup_path, `before-financial-year-undo-${Date.now()}.sqlite`);
+    this.writeAuditLog('financial_year', archiveId, 'undo', {
+      fromFinancialYear: archive.from_financial_year,
+      toFinancialYear: archive.to_financial_year,
+      periodStart: archive.period_start,
+      periodEnd: archive.period_end,
+      nextOpeningDate
+    });
     return {
       ok: true,
       path: archive.backup_path,
@@ -597,8 +627,7 @@ export class AccountingService {
     if (counterLedgerId === account.ledger_id) throw new Error('Opposite account cannot be the same as this account.');
     const amount = round(transaction.amount);
     const interestAmount = round(transaction.interestAmount ?? 0);
-    const interestLedgerId = interestAmount > 0 ? transaction.interestLedgerId || this.getOrCreateSystemLedger('Interest A/C', 'Income') : null;
-    const totalAmount = round(amount + interestAmount);
+    const interestLedgerId = interestAmount > 0 ? transaction.interestLedgerId || null : null;
     const narration = transaction.narration?.trim() || `${transaction.book} ${transaction.side} ${account.name}`;
     const oppositeLoanAccount = this.db.prepare('select * from loan_accounts where ledger_id=?').get(counterLedgerId) as any;
     const voucher =
@@ -610,8 +639,7 @@ export class AccountingService {
             narration,
             entries: [
               { ledgerId: account.ledger_id, debit: amount, credit: 0, narration },
-              ...(interestAmount > 0 && interestLedgerId ? [{ ledgerId: interestLedgerId, debit: interestAmount, credit: 0, narration: 'Interest' }] : []),
-              { ledgerId: counterLedgerId, debit: 0, credit: totalAmount, narration }
+              { ledgerId: counterLedgerId, debit: 0, credit: amount, narration }
             ]
           })
         : this.saveVoucher({
@@ -620,9 +648,8 @@ export class AccountingService {
             partyLedgerId: account.ledger_id,
             narration,
             entries: [
-              { ledgerId: counterLedgerId, debit: totalAmount, credit: 0, narration },
-              { ledgerId: account.ledger_id, debit: 0, credit: amount, narration },
-              ...(interestAmount > 0 && interestLedgerId ? [{ ledgerId: interestLedgerId, debit: 0, credit: interestAmount, narration: 'Interest' }] : [])
+              { ledgerId: counterLedgerId, debit: amount, credit: 0, narration },
+              { ledgerId: account.ledger_id, debit: 0, credit: amount, narration }
             ]
           });
     const monthlyRate = round(transaction.monthlyRate ?? account.default_rate ?? 1.5);
@@ -649,7 +676,7 @@ export class AccountingService {
         transaction.date,
         transaction.book,
         transaction.side === 'Dr' ? 'Cr' : 'Dr',
-        totalAmount,
+        amount,
         account.ledger_id,
         0,
         null,
@@ -660,6 +687,58 @@ export class AccountingService {
     }
     this.autoBackup();
     return this.loanTransactionById(Number(result.lastInsertRowid));
+  }
+
+  postManualInterest(accountId: number, date: string): Voucher {
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Interest posting date is required.');
+    const account = this.db.prepare('select * from loan_accounts where id=?').get(accountId) as any;
+    if (!account) throw new Error('Loan account not found.');
+    const breakdown = this.accountInterestBreakdown(account, date);
+    const totalInterest = round(breakdown.total);
+    if (Math.abs(totalInterest) < 0.005) throw new Error('There is no interest to post.');
+
+    const ledgerName = totalInterest >= 0 ? 'Interest Income' : 'Interest Expense';
+    const ledgerGroup = totalInterest >= 0 ? 'Income' : 'Expenses';
+    const interestLedgerId = this.getOrCreateSystemLedger(ledgerName, ledgerGroup);
+    const amount = Math.abs(totalInterest);
+    const narration = `Manual interest entry for ${account.name} up to ${date}.`;
+
+    const voucher = totalInterest >= 0
+      ? this.saveVoucher({
+          type: 'Journal',
+          date,
+          partyLedgerId: account.ledger_id,
+          narration,
+          entries: [
+            { ledgerId: account.ledger_id, debit: amount, credit: 0, narration },
+            { ledgerId: interestLedgerId, debit: 0, credit: amount, narration }
+          ]
+        })
+      : this.saveVoucher({
+          type: 'Journal',
+          date,
+          partyLedgerId: account.ledger_id,
+          narration,
+          entries: [
+            { ledgerId: interestLedgerId, debit: amount, credit: 0, narration },
+            { ledgerId: account.ledger_id, debit: 0, credit: amount, narration }
+          ]
+        });
+
+    this.db.prepare(
+      "update loan_accounts set previous_year_interest=0, current_interest_start_date=?, last_interest_posted_date=?, updated_at=datetime('now') where id=?"
+    ).run(date, date, account.id);
+    this.writeAuditLog('manual_interest', voucher.id ?? null, 'post', {
+      accountId: account.id,
+      accountName: account.name,
+      date,
+      previousYearInterest: breakdown.previous,
+      currentYearInterest: breakdown.current,
+      totalInterest,
+      voucherNo: voucher.voucherNo
+    });
+    this.autoBackup();
+    return voucher;
   }
 
   updateLoanTransaction(transaction: LoanTransaction): LoanTransaction {
@@ -673,8 +752,7 @@ export class AccountingService {
 
     const amount = round(transaction.amount);
     const interestAmount = round(transaction.interestAmount ?? 0);
-    const interestLedgerId = interestAmount > 0 ? transaction.interestLedgerId || this.getOrCreateSystemLedger('Interest A/C', 'Income') : null;
-    const totalAmount = round(amount + interestAmount);
+    const interestLedgerId = interestAmount > 0 ? transaction.interestLedgerId || null : null;
     const monthlyRate = round(transaction.monthlyRate ?? account.default_rate ?? 1.5);
     const narration = transaction.narration?.trim() || `${transaction.book} ${transaction.side} ${account.name}`;
     const oppositeAccount = this.db.prepare('select * from loan_accounts where ledger_id=?').get(transaction.counterLedgerId) as any;
@@ -684,17 +762,15 @@ export class AccountingService {
       if (!voucherId) throw new Error('The linked voucher could not be found.');
       const type = transaction.side === 'Dr' ? 'Payment' : 'Receipt';
       this.db.prepare("update vouchers set type=?, date=?, party_ledger_id=?, narration=?, total_debit=?, total_credit=?, updated_at=datetime('now') where id=?")
-        .run(type, transaction.date, account.ledger_id, narration, totalAmount, totalAmount, voucherId);
+        .run(type, transaction.date, account.ledger_id, narration, amount, amount, voucherId);
       this.db.prepare('delete from voucher_entries where voucher_id=?').run(voucherId);
       const insertEntry = this.db.prepare('insert into voucher_entries (voucher_id, ledger_id, debit, credit, narration) values (?, ?, ?, ?, ?)');
       if (transaction.side === 'Dr') {
         insertEntry.run(voucherId, account.ledger_id, amount, 0, narration);
-        if (interestAmount > 0 && interestLedgerId) insertEntry.run(voucherId, interestLedgerId, interestAmount, 0, 'Interest');
-        insertEntry.run(voucherId, transaction.counterLedgerId, 0, totalAmount, narration);
+        insertEntry.run(voucherId, transaction.counterLedgerId, 0, amount, narration);
       } else {
-        insertEntry.run(voucherId, transaction.counterLedgerId, totalAmount, 0, narration);
+        insertEntry.run(voucherId, transaction.counterLedgerId, amount, 0, narration);
         insertEntry.run(voucherId, account.ledger_id, 0, amount, narration);
-        if (interestAmount > 0 && interestLedgerId) insertEntry.run(voucherId, interestLedgerId, 0, interestAmount, 'Interest');
       }
 
       this.db.prepare(`update loan_transactions set account_id=?, date=?, book=?, side=?, amount=?, counter_ledger_id=?, interest_amount=?, interest_ledger_id=?, monthly_rate=?, narration=? where id=?`)
@@ -703,10 +779,10 @@ export class AccountingService {
       if (oppositeAccount) {
         if (mirror) {
           this.db.prepare(`update loan_transactions set account_id=?, date=?, book=?, side=?, amount=?, counter_ledger_id=?, interest_amount=0, interest_ledger_id=null, monthly_rate=?, narration=? where id=?`)
-            .run(oppositeAccount.id, transaction.date, transaction.book, transaction.side === 'Dr' ? 'Cr' : 'Dr', totalAmount, account.ledger_id, round(oppositeAccount.default_rate ?? monthlyRate), narration, mirror.id);
+            .run(oppositeAccount.id, transaction.date, transaction.book, transaction.side === 'Dr' ? 'Cr' : 'Dr', amount, account.ledger_id, round(oppositeAccount.default_rate ?? monthlyRate), narration, mirror.id);
         } else {
           this.db.prepare(`insert into loan_transactions (account_id, date, book, side, amount, counter_ledger_id, interest_amount, interest_ledger_id, monthly_rate, narration, voucher_id) values (?, ?, ?, ?, ?, ?, 0, null, ?, ?, ?)`)
-            .run(oppositeAccount.id, transaction.date, transaction.book, transaction.side === 'Dr' ? 'Cr' : 'Dr', totalAmount, account.ledger_id, round(oppositeAccount.default_rate ?? monthlyRate), narration, voucherId);
+            .run(oppositeAccount.id, transaction.date, transaction.book, transaction.side === 'Dr' ? 'Cr' : 'Dr', amount, account.ledger_id, round(oppositeAccount.default_rate ?? monthlyRate), narration, voucherId);
         }
       } else if (mirror) {
         this.db.prepare('delete from loan_transactions where id=?').run(mirror.id);
@@ -745,17 +821,15 @@ export class AccountingService {
       const rows = this.loanRows('where t.account_id=?', [account.id]);
       let kBalance = 0;
       let pBalance = 0;
-      let interest = 0;
       kBalance += Number(account.opening_k_balance || 0) * (account.opening_k_type === 'Cr' ? -1 : 1);
       pBalance += Number(account.opening_p_balance || 0) * (account.opening_p_type === 'Cr' ? -1 : 1);
       for (const row of rows) {
         const signed = row.side === 'Dr' ? Number(row.amount) : -Number(row.amount);
         if (row.book === 'K') kBalance += signed;
         else pBalance += signed;
-        interest += this.loanInterest(row, asOf);
       }
       const totalBalance = round(kBalance + pBalance);
-      const netInterest = round(interest);
+      const interest = this.accountInterestBreakdown(account, asOf);
       return {
         accountId: account.id,
         accountName: account.name,
@@ -763,8 +837,10 @@ export class AccountingService {
         kBalance: round(kBalance),
         pBalance: round(pBalance),
         totalBalance,
-        interest: netInterest,
-        netBalance: round(totalBalance + netInterest)
+        previousYearInterest: interest.previous,
+        currentYearInterest: interest.current,
+        interest: interest.total,
+        netBalance: round(totalBalance + interest.total)
       };
     });
   }
@@ -797,28 +873,15 @@ export class AccountingService {
         else pBal += signed;
       }
 
-      // Calculate K and P interest on opening balance
-      const openingDays = this.daysBetween(account.opening_date || today(), asOf);
-      const kOpeningInterest = Math.abs(kOpening) * (account.default_rate || 0) / 100 / 30 * openingDays * (kOpening >= 0 ? 1 : -1);
-      const pOpeningInterest = Math.abs(pOpening) * (account.default_rate || 0) / 100 / 30 * openingDays * (pOpening >= 0 ? 1 : -1);
-
-      let kInterest = round(kOpeningInterest);
-      let pInterest = round(pOpeningInterest);
-
-      for (const r of allRows) {
-        const interest = this.loanInterest(r, asOf);
-        if (r.book === 'K') kInterest += interest;
-        else pInterest += interest;
-      }
-
       // Filter by book if needed
       let effectiveKBal = book === 'P' ? 0 : kBal;
       let effectivePBal = book === 'K' ? 0 : pBal;
-      let effectiveKInt = book === 'P' ? 0 : kInterest;
-      let effectivePInt = book === 'K' ? 0 : pInterest;
+      let effectiveKInt = book === 'P' ? 0 : this.accountCurrentInterest(account, asOf, 'K');
+      let effectivePInt = book === 'K' ? 0 : this.accountCurrentInterest(account, asOf, 'P');
 
       const totalBalance = round(effectiveKBal + effectivePBal);
-      const totalInterest = round(effectiveKInt + effectivePInt);
+      const previousInterest = book ? 0 : round(account.previous_year_interest || 0);
+      const totalInterest = round(effectiveKInt + effectivePInt + previousInterest);
 
       if (Math.abs(totalInterest) < 0.005) continue;
 
@@ -829,7 +892,7 @@ export class AccountingService {
         kBalance: round(effectiveKBal),
         pBalance: round(effectivePBal),
         totalBalance,
-        kInterest: round(effectiveKInt),
+        kInterest: round(effectiveKInt + (book ? 0 : previousInterest)),
         pInterest: round(effectivePInt),
         totalInterest
       };
@@ -929,12 +992,53 @@ export class AccountingService {
       enabled: Boolean(settings.enabled),
       endpointUrl,
       authToken,
+      cloudTenantId: settings.cloudTenantId,
       lastSyncedAt: settings.lastSyncedAt,
       lastSyncMessage: settings.lastSyncMessage,
       syncIntervalMinutes: settings.syncIntervalMinutes
     };
     this.writeCloudSyncSettings(next);
     // Restart timer to reflect new settings
+    this.startAutoSyncTimer();
+    return next;
+  }
+
+  async generateCloudAccessKey(settings?: CloudSyncSettings): Promise<CloudSyncSettings> {
+    const current = { ...this.readCloudSyncSettings(), ...settings };
+    const endpointUrl = this.getCloudSyncEndpoint(current);
+    if (!endpointUrl) throw new Error('Cloud sync URL is not configured.');
+    this.validateCloudSyncEndpoint(endpointUrl);
+
+    const setupUrl = this.getCloudSetupEndpoint(current);
+    const cloudTenantId = (current.cloudTenantId || randomCloudKeyPart(8)).toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+    const secret = randomCloudKeyPart(16).replace(/(.{4})/g, '$1-').replace(/-$/, '');
+    const accessKey = `${cloudTenantId}-${secret}`;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (current.authToken?.trim()) headers.authorization = `Bearer ${current.authToken.trim()}`;
+
+    const response = await fetch(setupUrl, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({ accessKey })
+    });
+
+    const responseText = await response.text().catch(() => '');
+    let parsed: any = {};
+    try {
+      parsed = responseText ? JSON.parse(responseText) : {};
+    } catch {}
+
+    if (!response.ok) throw new Error(parsed.error || responseText || `Cloud server returned ${response.status}.`);
+
+    const next: CloudSyncSettings = {
+      ...current,
+      enabled: true,
+      endpointUrl: current.endpointUrl?.trim(),
+      authToken: parsed.key || accessKey,
+      cloudTenantId: parsed.tenantId || cloudTenantId,
+      lastSyncMessage: 'Access key generated. Sync now to publish latest data.'
+    };
+    this.writeCloudSyncSettings(next);
     this.startAutoSyncTimer();
     return next;
   }
@@ -1202,6 +1306,14 @@ export class AccountingService {
         ledger_count integer not null default 0,
         created_at text default current_timestamp
       );
+      create table if not exists audit_logs (
+        id integer primary key,
+        entity_type text not null,
+        entity_id integer,
+        action text not null,
+        details_json text not null,
+        created_at text default current_timestamp
+      );
     `);
     this.addColumnIfMissing('loan_accounts', 'category', "text not null default 'Debtors'");
     this.addColumnIfMissing('voucher_entries', 'balance_bd_id', 'integer');
@@ -1220,7 +1332,16 @@ export class AccountingService {
     this.addColumnIfMissing('loan_accounts', 'opening_p_type', "text not null default 'Dr'");
     this.addColumnIfMissing('loan_accounts', 'opening_date', "text not null default ''");
     this.addColumnIfMissing('loan_accounts', 'is_pinned', 'integer not null default 0');
+    this.addColumnIfMissing('loan_accounts', 'previous_year_interest', 'real not null default 0');
+    this.addColumnIfMissing('loan_accounts', 'current_interest_start_date', "text not null default ''");
+    this.addColumnIfMissing('loan_accounts', 'last_interest_posted_date', 'text');
+    this.addColumnIfMissing('financial_year_archives', 'previous_interest_json', 'text');
+    this.addColumnIfMissing('audit_logs', 'entity_type', "text not null default ''");
+    this.addColumnIfMissing('audit_logs', 'entity_id', 'integer');
+    this.addColumnIfMissing('audit_logs', 'action', "text not null default ''");
+    this.addColumnIfMissing('audit_logs', 'details_json', "text not null default '{}'");
     this.db.prepare("update loan_accounts set opening_date=? where opening_date is null or opening_date='' ").run(today());
+    this.db.prepare("update loan_accounts set current_interest_start_date=opening_date where current_interest_start_date is null or current_interest_start_date=''").run();
     if (this.getSetting('dual_opening_migrated') !== '1') {
       this.db.prepare(
         `update loan_accounts set
@@ -1303,12 +1424,6 @@ export class AccountingService {
   }
 
   private rollForwardOpeningBalances(trialBalance: TrialBalanceRow[], periodEnd: string, nextOpeningDate: string) {
-    const netProfit = round(
-      trialBalance.filter((row) => row.groupName === 'Income').reduce((sum, row) => sum + row.credit - row.debit, 0) -
-      trialBalance.filter((row) => row.groupName === 'Expenses').reduce((sum, row) => sum + row.debit - row.credit, 0)
-    );
-    const existingRetained = this.db.prepare("select id from ledgers where name='Retained Earnings'").get() as any;
-    const retainedLedgerId = Math.abs(netProfit) >= 0.005 ? this.getOrCreateSystemLedger('Retained Earnings', 'Capital') : existingRetained?.id;
     const loanAccounts = this.db.prepare('select * from loan_accounts').all() as any[];
     const loanBalanceByLedger = new Map<number, { k: number; p: number; total: number }>();
     for (const account of loanAccounts) {
@@ -1330,10 +1445,69 @@ export class AccountingService {
       let signed = trial ? round(trial.debit - trial.credit) : Number(ledger.opening_balance || 0) * (ledger.opening_type === 'Cr' ? -1 : 1);
       if (loanBalance) signed = loanBalance.total;
       if (!loanBalance && ['Income', 'Expenses'].includes(ledger.group_name)) signed = 0;
-      if (retainedLedgerId && ledger.id === retainedLedgerId) signed = round(signed - netProfit);
       const next = this.signedToBalance(signed);
       this.db.prepare("update ledgers set opening_balance=?, opening_type=?, updated_at=datetime('now') where id=?").run(next.amount, next.type, ledger.id);
     }
+  }
+
+  private storePreviousYearInterest(periodEnd: string, nextOpeningDate: string) {
+    const accounts = this.db.prepare('select * from loan_accounts').all() as any[];
+    const stmt = this.db.prepare(
+      "update loan_accounts set previous_year_interest=?, current_interest_start_date=?, updated_at=datetime('now') where id=?"
+    );
+    for (const account of accounts) {
+      const currentInterest = this.accountCurrentInterest(account, periodEnd);
+      const previousInterest = round(Number(account.previous_year_interest || 0) + currentInterest);
+      stmt.run(previousInterest, nextOpeningDate, account.id);
+    }
+  }
+
+  private loanPreviousInterestSnapshot(asOf?: string) {
+    const accounts = this.db.prepare('select * from loan_accounts order by name').all() as any[];
+    return accounts.map((account) => {
+      const previous = round(account.previous_year_interest || 0);
+      const current = asOf ? this.accountCurrentInterest(account, asOf) : 0;
+      return {
+        accountId: account.id,
+        accountName: account.name,
+        previousYearInterest: previous,
+        currentYearInterest: current,
+        totalInterest: round(previous + current)
+      };
+    });
+  }
+
+  private accountInterestBreakdown(account: any, asOf: string, bookFilter?: ReportBook): AccountInterestBreakdown {
+    const previous = bookFilter && bookFilter !== 'Combined' ? 0 : round(account.previous_year_interest || 0);
+    const current = this.accountCurrentInterest(account, asOf, bookFilter);
+    return { previous, current, total: round(previous + current) };
+  }
+
+  private accountCurrentInterest(account: any, asOf: string, bookFilter?: ReportBook): number {
+    const rows = this.loanRows('where t.account_id=? order by t.date, t.id', [account.id]);
+    const books: LoanBook[] = bookFilter === 'K' || bookFilter === 'P' ? [bookFilter] : ['K', 'P'];
+    let interest = 0;
+    for (const book of books) {
+      const opening = book === 'K' ? Number(account.opening_k_balance || 0) : Number(account.opening_p_balance || 0);
+      const openingType = book === 'K' ? account.opening_k_type : account.opening_p_type;
+      const signedOpening = opening * (openingType === 'Cr' ? -1 : 1);
+      const startDate = this.maxDate(account.opening_date || today(), account.current_interest_start_date || account.opening_date || today());
+      const openingDays = this.daysBetween(startDate, asOf);
+      interest += Math.abs(signedOpening) * Number(account.default_rate || 0) / 100 / 30 * openingDays * (signedOpening >= 0 ? 1 : -1);
+    }
+    for (const row of rows) {
+      if (bookFilter === 'K' || bookFilter === 'P') {
+        if (row.book !== bookFilter) continue;
+      }
+      interest += this.loanInterest(row, asOf);
+    }
+    return round(interest);
+  }
+
+  private maxDate(left: string, right: string): string {
+    if (!left) return right;
+    if (!right) return left;
+    return left >= right ? left : right;
   }
 
   private loanBookBalance(account: any, book: LoanBook, asOf: string): number {
@@ -1356,6 +1530,67 @@ export class AccountingService {
       return round(k + p);
     }
     return round(Number(ledger.openingBalance || 0) * (ledger.openingType === 'Cr' ? -1 : 1));
+  }
+
+  private ledgerOpeningSignedForBook(ledger: Ledger, book: ReportBook): number {
+    const loanAccount = ledger.id ? this.db.prepare('select * from loan_accounts where ledger_id=?').get(ledger.id) as any : null;
+    if (loanAccount) {
+      const k = Number(loanAccount.opening_k_balance || 0) * (loanAccount.opening_k_type === 'Cr' ? -1 : 1);
+      const p = Number(loanAccount.opening_p_balance || 0) * (loanAccount.opening_p_type === 'Cr' ? -1 : 1);
+      if (book === 'K') return round(k);
+      if (book === 'P') return round(p);
+      return round(k + p);
+    }
+    if (book !== 'Combined') return 0;
+    return round(Number(ledger.openingBalance || 0) * (ledger.openingType === 'Cr' ? -1 : 1));
+  }
+
+  private ledgerStatementForBook(ledgerId: number, filters: ReportFilters = {}): LedgerStatementRow[] {
+    const book = filters.book && filters.book !== 'Combined' ? filters.book : null;
+    const rows = this.db.prepare(
+      `select v.date, v.voucher_no, v.type, coalesce(ve.narration, v.narration) narration, ve.debit, ve.credit
+       from voucher_entries ve join vouchers v on v.id=ve.voucher_id
+       where ve.ledger_id=? and ve.balance_bd_id is null and ve.financial_year_archive_id is null ${filters.from ? 'and v.date >= ?' : ''} ${filters.to ? 'and v.date <= ?' : ''}
+         and (? is null or exists (select 1 from loan_transactions lt where lt.voucher_id=v.id and lt.book=?))
+       order by v.date, v.id`
+    ).all(ledgerId, ...[filters.from, filters.to].filter(Boolean), book, book) as any[];
+    let balance = 0;
+    return rows.map((row) => {
+      balance += Number(row.debit) - Number(row.credit);
+      return {
+        date: row.date,
+        voucherNo: row.voucher_no,
+        type: row.type,
+        narration: row.narration,
+        debit: round(row.debit),
+        credit: round(row.credit),
+        balance: round(balance)
+      };
+    });
+  }
+
+  private financialYearBookReport(book: ReportBook, ledgers: Ledger[], period: FinancialYearPeriod) {
+    const trialBalance = this.trialBalance({ to: period.end, book });
+    const profitLoss = this.profitLossData(period.end, book);
+    const ledgerStatements = ledgers.map((ledger) => {
+      const closing = trialBalance.find((row) => row.ledgerId === ledger.id);
+      const openingBalance = this.ledgerOpeningSignedForBook(ledger, book);
+      const rows = ledger.id ? this.ledgerStatementForBook(ledger.id, { from: period.start, to: period.end, book }).map((row) => ({ ...row, balance: round(row.balance + openingBalance) })) : [];
+      return {
+        ledger,
+        openingBalance,
+        closingBalance: closing ? round(closing.debit - closing.credit) : 0,
+        rows
+      };
+    });
+    return {
+      book,
+      label: book === 'K' ? 'Kacha' : book === 'P' ? 'Packa' : 'Combined',
+      trialBalance,
+      balanceSheet: trialBalance.filter((row) => ['Assets', 'Liabilities', 'Capital'].includes(row.groupName)),
+      profitLoss,
+      ledgers: ledgerStatements
+    };
   }
 
   private latestFinancialYearArchive(): FinancialYearArchive {
@@ -1390,80 +1625,183 @@ export class AccountingService {
     const { autoTable } = await import('jspdf-autotable');
     const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
     const margin = 36;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
     const title = `${snapshot.company.name || 'Firm'} - Financial Year ${snapshot.fromFinancialYear}`;
+    const periodText = `Period: ${this.formatDateText(snapshot.periodStart)} to ${this.formatDateText(snapshot.periodEnd)} | Closed to: ${snapshot.toFinancialYear}`;
 
-    doc.setFontSize(16);
-    doc.text(title, margin, 34);
-    doc.setFontSize(9);
-    doc.text(`Period: ${this.formatDateText(snapshot.periodStart)} to ${this.formatDateText(snapshot.periodEnd)} | Archive: ${archiveLabel}`, margin, 50);
-
-    let y = 70;
-    const section = (heading: string) => {
-      if (y > doc.internal.pageSize.getHeight() - 120) {
-        doc.addPage();
-        y = 40;
+    let y = 78;
+    const drawHeader = (heading?: string) => {
+      doc.setFontSize(15);
+      doc.text(snapshot.company.name || 'Financial Year Archive', margin, 30);
+      doc.setFontSize(9);
+      doc.text(periodText, margin, 45);
+      if (snapshot.company.address) doc.text(String(snapshot.company.address).slice(0, 130), margin, 59);
+      doc.setDrawColor(17, 24, 39);
+      doc.line(margin, 66, pageWidth - margin, 66);
+      if (heading) {
+        doc.setFontSize(12);
+        doc.text(heading, pageWidth / 2, 84, { align: 'center' });
+        y = 102;
+      } else {
+        y = 78;
       }
+    };
+    const addPage = (heading?: string) => {
+      doc.addPage();
+      drawHeader(heading);
+    };
+    const section = (heading: string) => {
+      if (y > pageHeight - 130) addPage();
       doc.setFontSize(12);
       doc.text(heading, margin, y);
       y += 12;
     };
-    const table = (head: string[][], body: any[][]) => {
+    const table = (head: string[][], body: any[][], options: Record<string, unknown> = {}) => {
       autoTable(doc, {
         head,
         body,
         startY: y,
         margin: { left: margin, right: margin },
         theme: 'grid',
-        styles: { fontSize: 7, cellPadding: 3, overflow: 'linebreak' },
-        headStyles: { fillColor: [37, 99, 235] }
+        styles: { fontSize: 7.5, cellPadding: 3, overflow: 'linebreak', lineColor: [148, 163, 184], lineWidth: 0.4 },
+        headStyles: { fillColor: [31, 41, 55], textColor: 255, halign: 'center' },
+        footStyles: { fillColor: [241, 245, 249], textColor: [15, 23, 42], fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        didDrawPage: () => drawFooter(),
+        ...options
       });
       y = ((doc as any).lastAutoTable?.finalY ?? y) + 18;
     };
+    const drawFooter = () => {
+      doc.setFontSize(8);
+      doc.setTextColor(100);
+      doc.text(`Archive: ${archiveLabel}`, margin, pageHeight - 18);
+      doc.text(`Generated by JJ Accounting`, pageWidth - margin, pageHeight - 18, { align: 'right' });
+      doc.setTextColor(0);
+    };
+    const signedBalance = (row: TrialBalanceRow) => round(Number(row.debit || 0) - Number(row.credit || 0));
+    const debitCreditAmount = (row: TrialBalanceRow) => Math.abs(signedBalance(row));
+    const total = (rows: TrialBalanceRow[], side: 'debit' | 'credit') =>
+      round(rows.reduce((sum, row) => sum + (side === 'debit' ? Number(row.debit || 0) : Number(row.credit || 0)), 0));
+    const pairedTableRows = (leftRows: any[][], rightRows: any[][], minRows = 1) => {
+      const count = Math.max(leftRows.length, rightRows.length, minRows);
+      return Array.from({ length: count }, (_, index) => [...(leftRows[index] ?? ['', '']), ...(rightRows[index] ?? ['', ''])]);
+    };
 
-    section('Trial Balance');
-    table([['Account', 'Group', 'Debit', 'Credit']], snapshot.trialBalance.map((row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]));
+    const reports = [
+      snapshot.bookReports?.Combined ?? {
+        label: 'Combined',
+        trialBalance: snapshot.trialBalance,
+        balanceSheet: snapshot.balanceSheet,
+        profitLoss: snapshot.profitLoss,
+        ledgers: snapshot.ledgers
+      },
+      snapshot.bookReports?.K,
+      snapshot.bookReports?.P
+    ].filter(Boolean);
 
-    section('Balance Sheet');
-    table([['Account', 'Group', 'Debit', 'Credit']], snapshot.balanceSheet.map((row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]));
+    const renderBookReport = (report: any, isFirst: boolean) => {
+      if (isFirst) drawHeader(`${report.label} Book Reports`);
+      else addPage(`${report.label} Book Reports`);
 
-    const incomeRows = snapshot.profitLoss.incomeRows ?? [];
-    const expenseRows = snapshot.profitLoss.expenseRows ?? [];
-    const income = incomeRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.credit - row.debit, 0);
-    const expenses = expenseRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.debit - row.credit, 0);
-    section('Profit and Loss');
-    table([['Particulars', 'Amount']], [
-      ['Total Income', this.moneyText(income)],
-      ['Total Expenses', this.moneyText(expenses)],
-      [income >= expenses ? 'Net Profit' : 'Net Loss', this.moneyText(Math.abs(income - expenses))]
-    ]);
+      const reportInterestReceivable = report.profitLoss.interestReceivable ?? [];
+      const reportInterestPayable = report.profitLoss.interestPayable ?? [];
+      const reportInterestReceivableTotal = round(reportInterestReceivable.reduce((sum: number, row: any) => sum + Number(row.totalInterest || 0), 0));
+      const reportInterestPayableTotal = round(reportInterestPayable.reduce((sum: number, row: any) => sum + Number(row.totalInterest || 0), 0));
+      const reportIncomeRows = report.profitLoss.incomeRows ?? [];
+      const reportExpenseRows = report.profitLoss.expenseRows ?? [];
+      const reportIncome = round(reportIncomeRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.credit - row.debit, 0) + reportInterestReceivableTotal);
+      const reportExpenses = round(reportExpenseRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.debit - row.credit, 0) + reportInterestPayableTotal);
+      const reportNetProfit = round(reportIncome - reportExpenses);
 
-    section('Ledger Index');
-    table([['Ledger', 'Group', 'Opening', 'Closing', 'Entries']], snapshot.ledgers.map((entry: any) => [entry.ledger.name, entry.ledger.groupName, this.balanceText(entry.openingBalance), this.balanceText(entry.closingBalance), String(entry.rows.length)]));
-
-    for (const entry of snapshot.ledgers) {
-      if (!entry.rows.length) continue;
-      doc.addPage();
-      y = 40;
-      doc.setFontSize(12);
-      doc.text(`Ledger: ${entry.ledger.name}`, margin, y);
-      y += 12;
+      section(`${report.label} Trial Balance`);
       table(
-        [['Date', 'Voucher', 'Type', 'Narration', 'Debit', 'Credit', 'Balance']],
-        [
-          ['', '', '', 'Opening Balance', '', '', this.balanceText(entry.openingBalance)],
-          ...entry.rows.map((row: LedgerStatementRow) => [
-            this.formatDateText(row.date),
-            row.voucherNo,
-            row.type,
-            row.narration,
-            this.moneyText(row.debit),
-            this.moneyText(row.credit),
-            this.moneyText(row.balance)
-          ]),
-          ['', '', '', 'Closing Balance', '', '', this.balanceText(entry.closingBalance)]
-        ]
+        [['Account', 'Group', 'Debit', 'Credit']],
+        report.trialBalance.map((row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]),
+        {
+          foot: [['Total', '', this.moneyText(total(report.trialBalance, 'debit')), this.moneyText(total(report.trialBalance, 'credit'))]],
+          columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' } }
+        }
       );
-    }
+
+      section(`${report.label} Profit and Loss Account`);
+      const expenseSide = reportExpenseRows
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, row.debit - row.credit))])
+        .filter((row: any[]) => Number(row[1]) > 0);
+      if (reportInterestPayableTotal > 0) expenseSide.push(['Accrued Interest Payable', this.moneyText(reportInterestPayableTotal)]);
+      const incomeSide = reportIncomeRows
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, row.credit - row.debit))])
+        .filter((row: any[]) => Number(row[1]) > 0);
+      if (reportInterestReceivableTotal > 0) incomeSide.push(['Accrued Interest Receivable', this.moneyText(reportInterestReceivableTotal)]);
+      if (reportNetProfit >= 0) expenseSide.push(['Net Profit', this.moneyText(reportNetProfit)]);
+      else incomeSide.push(['Net Loss', this.moneyText(Math.abs(reportNetProfit))]);
+      const profitLossTotal = Math.max(reportIncome, reportExpenses);
+      table(
+        [['Dr. Expenses', 'Amount', 'Cr. Income', 'Amount']],
+        pairedTableRows(expenseSide, incomeSide),
+        {
+          foot: [['Total', this.moneyText(profitLossTotal), 'Total', this.moneyText(profitLossTotal)]],
+          columnStyles: { 1: { halign: 'right' }, 3: { halign: 'right' } }
+        }
+      );
+
+      section(`${report.label} Balance Sheet`);
+      const liabilityRows = report.balanceSheet
+        .filter((row: TrialBalanceRow) => ['Liabilities', 'Capital'].includes(row.groupName))
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, -signedBalance(row)))])
+        .filter((row: any[]) => Number(row[1]) > 0);
+      const assetRows = report.balanceSheet
+        .filter((row: TrialBalanceRow) => row.groupName === 'Assets')
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(debitCreditAmount(row))])
+        .filter((row: any[]) => Number(row[1]) > 0);
+      const liabilitiesTotal = round(liabilityRows.reduce((sum: number, row: any[]) => sum + Number(row[1] || 0), 0));
+      const assetsTotal = round(assetRows.reduce((sum: number, row: any[]) => sum + Number(row[1] || 0), 0));
+      table(
+        [['Liabilities & Capital', 'Amount', 'Assets', 'Amount']],
+        pairedTableRows(liabilityRows, assetRows),
+        {
+          foot: [['Total', this.moneyText(liabilitiesTotal), 'Total', this.moneyText(assetsTotal)]],
+          columnStyles: { 1: { halign: 'right' }, 3: { halign: 'right' } }
+        }
+      );
+
+      section(`${report.label} Ledger Index`);
+      table(
+        [['Ledger', 'Group', 'Opening', 'Closing', 'Entries']],
+        report.ledgers.map((entry: any) => [entry.ledger.name, entry.ledger.groupName, this.balanceText(entry.openingBalance), this.balanceText(entry.closingBalance), String(entry.rows.length)]),
+        { columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' } } }
+      );
+
+      for (const entry of report.ledgers) {
+        if (!entry.rows.length && Math.abs(entry.openingBalance || 0) < 0.005 && Math.abs(entry.closingBalance || 0) < 0.005) continue;
+        addPage(`${report.label} Ledger Account: ${entry.ledger.name}`);
+        const debitRows: any[][] = [];
+        const creditRows: any[][] = [];
+        const opening = round(entry.openingBalance || 0);
+        if (opening > 0) debitRows.push(['', 'To Opening Balance', '', this.moneyText(opening)]);
+        if (opening < 0) creditRows.push(['', 'By Opening Balance', '', this.moneyText(Math.abs(opening))]);
+        for (const row of entry.rows as LedgerStatementRow[]) {
+          if (Number(row.debit || 0) > 0) debitRows.push([this.formatDateText(row.date), `To ${row.narration || row.type}`, row.voucherNo, this.moneyText(row.debit)]);
+          if (Number(row.credit || 0) > 0) creditRows.push([this.formatDateText(row.date), `By ${row.narration || row.type}`, row.voucherNo, this.moneyText(row.credit)]);
+        }
+        const closing = round(entry.closingBalance || 0);
+        if (closing > 0) creditRows.push(['', 'By Balance c/d', '', this.moneyText(closing)]);
+        if (closing < 0) debitRows.push(['', 'To Balance c/d', '', this.moneyText(Math.abs(closing))]);
+        const debitTotal = round(debitRows.reduce((sum, row) => sum + Number(row[3] || 0), 0));
+        const creditTotal = round(creditRows.reduce((sum, row) => sum + Number(row[3] || 0), 0));
+        table(
+          [['Date', 'Debit Particulars', 'Vch', 'Amount', 'Date', 'Credit Particulars', 'Vch', 'Amount']],
+          pairedTableRows(debitRows, creditRows, 6),
+          {
+            foot: [['', 'Total', '', this.moneyText(debitTotal), '', 'Total', '', this.moneyText(creditTotal)]],
+            columnStyles: { 3: { halign: 'right' }, 7: { halign: 'right' } }
+          }
+        );
+      }
+    };
+
+    reports.forEach((report, index) => renderBookReport(report, index === 0));
 
     doc.setProperties({ title, subject: 'Financial year archive', creator: 'JJ Accounting' });
     const pdf = Buffer.from(doc.output('arraybuffer'));
@@ -1472,20 +1810,98 @@ export class AccountingService {
   }
 
   private financialYearHtml(snapshot: any): string {
-    const rows = (items: any[], cells: (item: any) => string[]) => items.map((item) => `<tr>${cells(item).map((cell) => `<td>${this.escapeHtml(cell)}</td>`).join('')}</tr>`).join('');
-    const table = (head: string[], body: string) => `<table><thead><tr>${head.map((cell) => `<th>${this.escapeHtml(cell)}</th>`).join('')}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}">No records</td></tr>`}</tbody></table>`;
-    const trialRows = rows(snapshot.trialBalance, (row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]);
-    const balanceRows = rows(snapshot.balanceSheet, (row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]);
-    const ledgerSections = snapshot.ledgers.map((entry: any) => `
-      <section>
-        <h2>${this.escapeHtml(entry.ledger.name)}</h2>
-        ${table(['Date', 'Voucher', 'Type', 'Narration', 'Debit', 'Credit', 'Balance'], `
-          <tr><td></td><td></td><td></td><td>Opening Balance</td><td></td><td></td><td>${this.escapeHtml(this.balanceText(entry.openingBalance))}</td></tr>
-          ${rows(entry.rows, (row: LedgerStatementRow) => [this.formatDateText(row.date), row.voucherNo, row.type, row.narration, this.moneyText(row.debit), this.moneyText(row.credit), this.moneyText(row.balance)])}
-          <tr><td></td><td></td><td></td><td>Closing Balance</td><td></td><td></td><td>${this.escapeHtml(this.balanceText(entry.closingBalance))}</td></tr>
-        `)}
-      </section>
-    `).join('');
+    const rows = (items: any[], cells: (item: any) => string[], className = '') => items.map((item) => `<tr${className ? ` class="${className}"` : ''}>${cells(item).map((cell) => `<td>${this.escapeHtml(cell)}</td>`).join('')}</tr>`).join('');
+    const table = (head: string[], body: string, foot = '') => `<table><thead><tr>${head.map((cell) => `<th>${this.escapeHtml(cell)}</th>`).join('')}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}">No records</td></tr>`}</tbody>${foot ? `<tfoot>${foot}</tfoot>` : ''}</table>`;
+    const signedBalance = (row: TrialBalanceRow) => round(Number(row.debit || 0) - Number(row.credit || 0));
+    const pairedRows = (leftRows: string[][], rightRows: string[][], minRows = 1) => {
+      const count = Math.max(leftRows.length, rightRows.length, minRows);
+      return Array.from({ length: count }, (_, index) => {
+        const left = leftRows[index] ?? ['', ''];
+        const right = rightRows[index] ?? ['', ''];
+        return `<tr><td>${this.escapeHtml(left[0])}</td><td class="num">${this.escapeHtml(left[1])}</td><td>${this.escapeHtml(right[0])}</td><td class="num">${this.escapeHtml(right[1])}</td></tr>`;
+      }).join('');
+    };
+    const reports = [
+      snapshot.bookReports?.Combined ?? {
+        label: 'Combined',
+        trialBalance: snapshot.trialBalance,
+        balanceSheet: snapshot.balanceSheet,
+        profitLoss: snapshot.profitLoss,
+        ledgers: snapshot.ledgers
+      },
+      snapshot.bookReports?.K,
+      snapshot.bookReports?.P
+    ].filter(Boolean);
+    const reportSections = reports.map((report: any) => {
+      const interestReceivable = report.profitLoss.interestReceivable ?? [];
+      const interestPayable = report.profitLoss.interestPayable ?? [];
+      const totalInterestReceivable = round(interestReceivable.reduce((sum: number, row: any) => sum + Number(row.totalInterest || 0), 0));
+      const totalInterestPayable = round(interestPayable.reduce((sum: number, row: any) => sum + Number(row.totalInterest || 0), 0));
+      const incomeRows = report.profitLoss.incomeRows ?? [];
+      const expenseRows = report.profitLoss.expenseRows ?? [];
+      const income = round(incomeRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.credit - row.debit, 0) + totalInterestReceivable);
+      const expenses = round(expenseRows.reduce((sum: number, row: TrialBalanceRow) => sum + row.debit - row.credit, 0) + totalInterestPayable);
+      const netProfit = round(income - expenses);
+      const trialDebit = round(report.trialBalance.reduce((sum: number, row: TrialBalanceRow) => sum + Number(row.debit || 0), 0));
+      const trialCredit = round(report.trialBalance.reduce((sum: number, row: TrialBalanceRow) => sum + Number(row.credit || 0), 0));
+      const trialRows = rows(report.trialBalance, (row: TrialBalanceRow) => [row.ledgerName, row.groupName, this.moneyText(row.debit), this.moneyText(row.credit)]);
+
+      const expenseSide = expenseRows
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, row.debit - row.credit))])
+        .filter((row: string[]) => Number(row[1]) > 0);
+      if (totalInterestPayable > 0) expenseSide.push(['Accrued Interest Payable', this.moneyText(totalInterestPayable)]);
+      const incomeSide = incomeRows
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, row.credit - row.debit))])
+        .filter((row: string[]) => Number(row[1]) > 0);
+      if (totalInterestReceivable > 0) incomeSide.push(['Accrued Interest Receivable', this.moneyText(totalInterestReceivable)]);
+      if (netProfit >= 0) expenseSide.push(['Net Profit', this.moneyText(netProfit)]);
+      else incomeSide.push(['Net Loss', this.moneyText(Math.abs(netProfit))]);
+      const plTotal = this.moneyText(Math.max(income, expenses));
+
+      const liabilityRows = report.balanceSheet
+        .filter((row: TrialBalanceRow) => ['Liabilities', 'Capital'].includes(row.groupName))
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.max(0, -signedBalance(row)))])
+        .filter((row: string[]) => Number(row[1]) > 0);
+      const assetRows = report.balanceSheet
+        .filter((row: TrialBalanceRow) => row.groupName === 'Assets')
+        .map((row: TrialBalanceRow) => [row.ledgerName, this.moneyText(Math.abs(signedBalance(row)))])
+        .filter((row: string[]) => Number(row[1]) > 0);
+      const liabilityTotal = this.moneyText(liabilityRows.reduce((sum: number, row: string[]) => sum + Number(row[1] || 0), 0));
+      const assetTotal = this.moneyText(assetRows.reduce((sum: number, row: string[]) => sum + Number(row[1] || 0), 0));
+
+      const ledgerSections = report.ledgers.map((entry: any) => {
+        if (!entry.rows.length && Math.abs(entry.openingBalance || 0) < 0.005 && Math.abs(entry.closingBalance || 0) < 0.005) return '';
+        const debitRows: string[][] = [];
+        const creditRows: string[][] = [];
+        const opening = round(entry.openingBalance || 0);
+        if (opening > 0) debitRows.push(['To Opening Balance', this.moneyText(opening)]);
+        if (opening < 0) creditRows.push(['By Opening Balance', this.moneyText(Math.abs(opening))]);
+        for (const row of entry.rows as LedgerStatementRow[]) {
+          if (Number(row.debit || 0) > 0) debitRows.push([`${this.formatDateText(row.date)}  To ${row.narration || row.type}`, this.moneyText(row.debit)]);
+          if (Number(row.credit || 0) > 0) creditRows.push([`${this.formatDateText(row.date)}  By ${row.narration || row.type}`, this.moneyText(row.credit)]);
+        }
+        const closing = round(entry.closingBalance || 0);
+        if (closing > 0) creditRows.push(['By Balance c/d', this.moneyText(closing)]);
+        if (closing < 0) debitRows.push(['To Balance c/d', this.moneyText(Math.abs(closing))]);
+        const debitTotal = this.moneyText(debitRows.reduce((sum, row) => sum + Number(row[1] || 0), 0));
+        const creditTotal = this.moneyText(creditRows.reduce((sum, row) => sum + Number(row[1] || 0), 0));
+        return `<section class="ledger-section"><h3>${this.escapeHtml(report.label)} Ledger: ${this.escapeHtml(entry.ledger.name)}</h3>${table(['Debit Particulars', 'Amount', 'Credit Particulars', 'Amount'], pairedRows(debitRows, creditRows, 6), `<tr><td>Total</td><td class="num">${debitTotal}</td><td>Total</td><td class="num">${creditTotal}</td></tr>`)}</section>`;
+      }).join('');
+
+      return `
+        <section class="book-section">
+          <h2>${this.escapeHtml(report.label)} Book</h2>
+          <h3>Trial Balance</h3>
+          ${table(['Account', 'Group', 'Debit', 'Credit'], trialRows, `<tr><td>Total</td><td></td><td class="num">${this.moneyText(trialDebit)}</td><td class="num">${this.moneyText(trialCredit)}</td></tr>`)}
+          <h3>Profit and Loss Account</h3>
+          ${table(['Dr. Expenses', 'Amount', 'Cr. Income', 'Amount'], pairedRows(expenseSide, incomeSide), `<tr><td>Total</td><td class="num">${plTotal}</td><td>Total</td><td class="num">${plTotal}</td></tr>`)}
+          <h3>Balance Sheet</h3>
+          ${table(['Liabilities & Capital', 'Amount', 'Assets', 'Amount'], pairedRows(liabilityRows, assetRows), `<tr><td>Total</td><td class="num">${liabilityTotal}</td><td>Total</td><td class="num">${assetTotal}</td></tr>`)}
+          <h3>Ledger Accounts</h3>
+          ${ledgerSections || '<p>No ledger movement for this book.</p>'}
+        </section>
+      `;
+    }).join('');
     return `<!doctype html>
 <html>
 <head>
@@ -1494,12 +1910,12 @@ export class AccountingService {
   <style>
     body{font-family:Arial,sans-serif;color:#111;margin:32px;line-height:1.35}
     header{border-bottom:2px solid #111;margin-bottom:24px;padding-bottom:14px}
-    h1{font-size:24px;margin:0 0 6px} h2{font-size:17px;margin:24px 0 8px}
+    h1{font-size:24px;margin:0 0 6px} h2{font-size:18px;margin:24px 0 8px;text-align:center} h3{font-size:14px;margin:18px 0 8px}
     .meta{font-size:12px;color:#555}
     table{width:100%;border-collapse:collapse;margin:8px 0 18px;table-layout:fixed}
     th,td{border:1px solid #999;padding:6px 8px;font-size:11px;text-align:left;vertical-align:top;word-wrap:break-word}
-    th{background:#eef2f7}
-    @media print{body{margin:12mm}section{break-inside:avoid}}
+    th{background:#eef2f7}.num{text-align:right}tfoot td{font-weight:bold;background:#f8fafc}.book-section{page-break-before:always}.book-section:first-of-type{page-break-before:auto}.ledger-section{break-inside:avoid}
+    @media print{body{margin:12mm}.book-section{page-break-before:always}.book-section:first-of-type{page-break-before:auto}}
   </style>
 </head>
 <body>
@@ -1507,9 +1923,7 @@ export class AccountingService {
     <h1>${this.escapeHtml(snapshot.company.name || 'Financial Year Archive')}</h1>
     <div class="meta">Financial Year: ${this.escapeHtml(snapshot.fromFinancialYear)} | Period: ${this.formatDateText(snapshot.periodStart)} to ${this.formatDateText(snapshot.periodEnd)} | New Year: ${this.escapeHtml(snapshot.toFinancialYear)}</div>
   </header>
-  <section><h2>Trial Balance</h2>${table(['Account', 'Group', 'Debit', 'Credit'], trialRows)}</section>
-  <section><h2>Balance Sheet</h2>${table(['Account', 'Group', 'Debit', 'Credit'], balanceRows)}</section>
-  <section><h2>Ledger Statements</h2>${ledgerSections}</section>
+  ${reportSections}
 </body>
 </html>`;
   }
@@ -1539,7 +1953,7 @@ export class AccountingService {
 
   private loanRows(whereSql: string, args: unknown[], includeArchived = false) {
     const archiveClause = includeArchived ? '' : 't.balance_bd_id is null and t.financial_year_archive_id is null';
-    let sql = `select t.*, a.name account_name, a.default_rate account_default_rate, c.name counter_ledger_name, i.name interest_ledger_name
+    let sql = `select t.*, a.name account_name, a.default_rate account_default_rate, a.current_interest_start_date account_current_interest_start_date, c.name counter_ledger_name, i.name interest_ledger_name
        from loan_transactions t
        join loan_accounts a on a.id=t.account_id
        join ledgers c on c.id=t.counter_ledger_id
@@ -1566,10 +1980,40 @@ export class AccountingService {
   }
 
   private loanInterest(row: any, asOf: string): number {
-    if (Number(row.account_default_rate) === 0) return 0;
-    const days = this.daysBetween(row.date, asOf);
-    const interest = Number(row.amount || 0) * (Number(row.monthly_rate || 0) / 100) / 30 * days;
+    const monthlyRate = Number(row.monthly_rate ?? row.monthlyRate ?? row.account_default_rate ?? 0);
+    if (monthlyRate === 0) return 0;
+    const startDate = this.maxDate(row.date, row.account_current_interest_start_date || row.currentInterestStartDate || row.date);
+    const days = this.daysBetween(startDate, asOf);
+    const interest = Number(row.amount || 0) * (monthlyRate / 100) / 30 * days;
     return round(row.side === 'Dr' ? interest : -interest);
+  }
+
+  private hasTransactionsOnOrAfter(date: string): boolean {
+    const voucher = this.db.prepare('select id from vouchers where date >= ? limit 1').get(date);
+    const invoice = this.db.prepare('select id from invoices where date >= ? limit 1').get(date);
+    const loanTransaction = this.db.prepare('select id from loan_transactions where date >= ? limit 1').get(date);
+    return Boolean(voucher || invoice || loanTransaction);
+  }
+
+  private writeAuditLog(entityType: string, entityId: number | null | undefined, action: string, details: unknown) {
+    const columns = new Set((this.db.prepare('pragma table_info(audit_logs)').all() as any[]).map((row) => row.name));
+    const detailsJson = JSON.stringify(details);
+    const payload: Record<string, unknown> = {};
+
+    if (columns.has('entity_type')) payload.entity_type = entityType;
+    if (columns.has('entity_id')) payload.entity_id = entityId ?? null;
+    if (columns.has('event_type')) payload.event_type = entityType;
+    if (columns.has('event_id')) payload.event_id = entityId ?? null;
+    if (columns.has('action')) payload.action = action;
+    if (columns.has('message')) payload.message = `${entityType} ${action}`;
+    if (columns.has('details_json')) payload.details_json = detailsJson;
+    if (columns.has('details')) payload.details = detailsJson;
+    if (columns.has('metadata')) payload.metadata = detailsJson;
+
+    const insertColumns = Object.keys(payload);
+    if (!insertColumns.length) return;
+    const placeholders = insertColumns.map(() => '?').join(', ');
+    this.db.prepare(`insert into audit_logs (${insertColumns.join(', ')}) values (${placeholders})`).run(...insertColumns.map((column) => payload[column]));
   }
 
   private daysBetween(from: string, to: string): number {
@@ -1777,6 +2221,12 @@ export class AccountingService {
     return (process.env.CLOUD_SYNC_URL || settings.endpointUrl || DEFAULT_CLOUD_SYNC_URL).trim();
   }
 
+  private getCloudSetupEndpoint(settings: CloudSyncSettings) {
+    const parsed = new URL(this.getCloudSyncEndpoint(settings));
+    parsed.pathname = parsed.pathname.replace(/\/api\/sync$/, '/api/setup');
+    return parsed.toString();
+  }
+
   private readCloudSyncSettings(): CloudSyncSettings {
     const defaults: CloudSyncSettings = { enabled: false, authToken: '' };
     if (!fs.existsSync(this.cloudSyncPath)) return defaults;
@@ -1786,6 +2236,7 @@ export class AccountingService {
         enabled: Boolean(parsed.enabled),
         endpointUrl: typeof parsed.endpointUrl === 'string' ? parsed.endpointUrl : undefined,
         authToken: typeof parsed.authToken === 'string' ? parsed.authToken : '',
+        cloudTenantId: typeof parsed.cloudTenantId === 'string' ? parsed.cloudTenantId : undefined,
         lastSyncedAt: typeof parsed.lastSyncedAt === 'string' ? parsed.lastSyncedAt : undefined,
         lastSyncMessage: typeof parsed.lastSyncMessage === 'string' ? parsed.lastSyncMessage : undefined,
         syncIntervalMinutes: typeof parsed.syncIntervalMinutes === 'number' ? parsed.syncIntervalMinutes : 30
@@ -1877,6 +2328,9 @@ export class AccountingService {
       ,openingPBalance: round(row.opening_p_balance || 0)
       ,openingPType: row.opening_p_type ?? 'Dr'
       ,openingDate: row.opening_date || today()
+      ,previousYearInterest: round(row.previous_year_interest || 0)
+      ,currentInterestStartDate: row.current_interest_start_date || row.opening_date || today()
+      ,lastInterestPostedDate: row.last_interest_posted_date
       ,pinned: Boolean(row.is_pinned)
     };
   }
@@ -1933,9 +2387,9 @@ export class AccountingService {
     const kTotals = this.getBookLedgerTotals(account, rows, 'K', asOfDate);
     const pTotals = this.getBookLedgerTotals(account, rows, 'P', asOfDate);
 
-    // Calculate new opening balances (principal + interest)
-    const netK = round(kTotals.balance + kTotals.interest);
-    const netP = round(pTotals.balance + pTotals.interest);
+    // Carry only principal closing balance into the new opening balance.
+    const netK = round(kTotals.balance);
+    const netP = round(pTotals.balance);
     const netLedger = round(netK + netP);
 
     const postKBalance = Math.abs(netK);
@@ -2093,6 +2547,54 @@ export class AccountingService {
     return false;
   }
 
+  async printPDFFile(filePath: string, orientation: 'portrait' | 'landscape' = 'portrait'): Promise<boolean> {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    const printablePath = filePath.toLowerCase().endsWith('.pdf')
+      ? filePath.replace(/\.pdf$/i, '.html')
+      : filePath;
+    const targetPath = fs.existsSync(printablePath) ? printablePath : filePath;
+    const printWindow = new BrowserWindow({
+      show: true,
+      width: 980,
+      height: 720,
+      title: `Print ${orientation === 'landscape' ? 'Landscape' : 'Portrait'}`,
+      autoHideMenuBar: true,
+      webPreferences: {
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false
+      }
+    });
+    try {
+      await printWindow.loadFile(targetPath);
+      await printWindow.webContents.executeJavaScript(`
+        (() => {
+          const style = document.createElement('style');
+          style.textContent = '@page { size: A4 ${orientation}; margin: 10mm; }';
+          document.head.appendChild(style);
+        })();
+      `);
+      printWindow.show();
+      printWindow.focus();
+      await printWindow.webContents.executeJavaScript(`
+        new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            resolve(true);
+          };
+          window.addEventListener('afterprint', finish, { once: true });
+          setTimeout(finish, 60000);
+          window.print();
+        });
+      `);
+      return true;
+    } finally {
+      if (!printWindow.isDestroyed()) printWindow.close();
+    }
+  }
+
   resetDatabase(): boolean {
     try {
       try {
@@ -2128,7 +2630,7 @@ export class AccountingService {
     const bookRows = rows.filter((row) => row.book === book);
     const opening = book === 'K' ? Number(account.opening_k_balance || 0) : Number(account.opening_p_balance || 0);
     const openingType = book === 'K' ? account.opening_k_type : account.opening_p_type;
-    const openingDate = account.opening_date;
+    const openingDate = this.maxDate(account.opening_date, account.current_interest_start_date || account.opening_date);
     const openingDays = this.daysBetween(openingDate, asOf);
     const openingInterest = opening * (account.default_rate || 1.5) / 100 / 30 * openingDays * (openingType === 'Cr' ? -1 : 1);
 
@@ -2143,7 +2645,7 @@ export class AccountingService {
     const bookRows = rows.filter((row) => row.book === book);
     const opening = book === 'K' ? Number(account.opening_k_balance || 0) : Number(account.opening_p_balance || 0);
     const openingType = book === 'K' ? account.opening_k_type : account.opening_p_type;
-    const openingDate = account.opening_date;
+    const openingDate = this.maxDate(account.opening_date, account.current_interest_start_date || account.opening_date);
     const openingDays = this.daysBetween(openingDate, asOf);
     const openingInterest = opening * (account.default_rate || 1.5) / 100 / 30 * openingDays * (openingType === 'Cr' ? -1 : 1);
 

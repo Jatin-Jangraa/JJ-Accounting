@@ -150,6 +150,9 @@ export interface LoanAccount {
   openingPBalance?: number;
   openingPType?: DrCr;
   openingDate: string;
+  previousYearInterest?: number;
+  currentInterestStartDate?: string;
+  lastInterestPostedDate?: string | null;
   pinned?: boolean;
 }
 
@@ -183,6 +186,8 @@ export interface LoanSummaryRow {
   kBalance: number;
   pBalance: number;
   totalBalance: number;
+  previousYearInterest: number;
+  currentYearInterest: number;
   interest: number;
   netBalance: number;
 }
@@ -253,6 +258,7 @@ export interface CloudSyncSettings {
   enabled: boolean;
   endpointUrl?: string;
   authToken: string;
+  cloudTenantId?: string;
   lastSyncedAt?: string;
   lastSyncMessage?: string;
   syncIntervalMinutes?: number;

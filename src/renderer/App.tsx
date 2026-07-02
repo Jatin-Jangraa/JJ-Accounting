@@ -11,6 +11,16 @@ const today = () => new Date().toISOString().slice(0, 10);
 const amount = (value = 0) => Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
 const dateText = (date?: string) => date ? date.split('-').reverse().join('-') : '';
 const dateTimeText = (date?: string) => date ? new Date(date).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }) : 'Not available';
+const addDays = (date: string, days: number) => {
+  const [year, month, day] = date.split('-').map(Number);
+  const value = new Date(Date.UTC(year, month - 1, day + days));
+  return Number.isFinite(value.getTime()) ? value.toISOString().slice(0, 10) : '';
+};
+const maxDate = (left?: string, right?: string) => {
+  if (!left) return right || '';
+  if (!right) return left;
+  return left >= right ? left : right;
+};
 const daysBetweenDates = (from?: string, to?: string) => {
   if (!from || !to) return 0;
   const [fromYear, fromMonth, fromDay] = from.split('-').map(Number);
@@ -20,11 +30,34 @@ const daysBetweenDates = (from?: string, to?: string) => {
 };
 const bookLabel = (book: ReportBook) => book === 'K' ? 'Khacha' : book === 'P' ? 'Packa' : 'Combined';
 const safeFileName = (name: string) => name.replace(/[^a-z0-9-_]+/gi, '-').replace(/^-|-$/g, '').toLowerCase();
+const parseFinancialYear = (financialYear?: string) => {
+  const value = financialYear?.trim() || '';
+  const explicit = value.match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})/);
+  if (explicit) return { start: explicit[1], end: explicit[2], label: value };
+  const range = value.match(/(\d{4})\D+(\d{2,4})/);
+  if (!range) return null;
+  const startYear = Number(range[1]);
+  let endYear = Number(range[2]);
+  if (endYear < 100) endYear = Math.floor(startYear / 100) * 100 + endYear;
+  if (endYear <= startYear) endYear += 100;
+  return { start: `${startYear}-04-01`, end: `${endYear}-03-31`, label: `${startYear}-${endYear}` };
+};
+const nextFinancialYearLabel = (financialYear?: string) => {
+  const parsed = parseFinancialYear(financialYear);
+  if (!parsed) return '';
+  const nextStartYear = Number(parsed.end.slice(0, 4));
+  return `${nextStartYear}-${nextStartYear + 1}`;
+};
 const defaultCategories = ['Debtors', 'Creditors', 'Capital', 'Income', 'Expenses', 'Other A/C'];
 const appName = 'JJ Accounting';
 const defaultCompany = (): Company => ({ name: '', shopNo: '', address: '', phone: '', email: '', gstin: '', financialYear: '' });
 const blankAccount: LoanAccount = { name: '', category: 'Debtors', phone: '', address: '', defaultRate: 1.5, note: '', openingKBalance: 0, openingKType: 'Dr', openingPBalance: 0, openingPType: 'Dr', openingDate: today() };
 const emptyAccount = (): LoanAccount => ({ ...blankAccount });
+const restoreKeyboardFocus = () => {
+  window.windowControls?.focus?.();
+  window.focus();
+  requestAnimationFrame(() => window.windowControls?.focus?.());
+};
 const blankEntry: LoanTransaction = {
   accountId: 0,
   date: today(),
@@ -172,6 +205,7 @@ function App() {
       toast.error(error.message);
     } finally {
       setAccountBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -189,6 +223,7 @@ function App() {
       toast.error(error.message);
     } finally {
       setAccountBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -266,9 +301,34 @@ function App() {
     }
   };
 
+  const postManualInterest = async () => {
+    if (!activeAccount?.id || !activeSummary) return;
+    const previous = Number(activeSummary.previousYearInterest || 0);
+    const current = Number(activeSummary.currentYearInterest || 0);
+    const total = Number(activeSummary.interest || 0);
+    if (Math.abs(total) < 0.005) {
+      toast.info('There is no interest to post.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Pass manual Interest Entry for ${activeAccount.name} on ${dateText(asOf)}?\n\nPrincipal: ₹ ${amount(activeSummary.totalBalance)}\nPrevious Interest: ₹ ${amount(previous)}\nCurrent Interest: ₹ ${amount(current)}\nTotal Interest: ₹ ${amount(total)}\n\nThis will create a journal entry and reset previous/current interest to zero.`
+    );
+    restoreKeyboardFocus();
+    if (!confirmed) return;
+    try {
+      await window.accounting.postManualInterest(activeAccount.id, asOf);
+      await load(selectedId, asOf);
+      toast.success('Manual interest entry posted');
+    } catch (error: any) {
+      toast.error(error.message);
+    }
+  };
+
   const deleteAccount = async (account: LoanAccount | null) => {
     if (!account?.id) return;
-    if (!confirm(`Delete ${account.name} and all its entries?`)) return;
+    const confirmed = confirm(`Delete ${account.name} and all its entries?`);
+    restoreKeyboardFocus();
+    if (!confirmed) return;
     if (accountBusy) return;
     setAccountBusy(true);
     try {
@@ -284,6 +344,7 @@ function App() {
       toast.error(error.message);
     } finally {
       setAccountBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -346,7 +407,7 @@ function App() {
         const openingType = book === 'K' ? activeAccount.openingKType : activeAccount.openingPType;
         const debit = bookRows.filter((row) => row.side === 'Dr').reduce((sum, row) => sum + Number(row.amount || 0), openingType !== 'Cr' ? opening : 0);
         const credit = bookRows.filter((row) => row.side === 'Cr').reduce((sum, row) => sum + Number(row.amount || 0), openingType === 'Cr' ? opening : 0);
-        const openingDays = daysBetweenDates(activeAccount.openingDate, asOf);
+        const openingDays = daysBetweenDates(maxDate(activeAccount.openingDate, activeAccount.currentInterestStartDate), asOf);
         const openingInterest = opening * Number(activeAccount.defaultRate || 0) / 100 / 30 * openingDays * (openingType === 'Cr' ? -1 : 1);
         const interest = openingInterest + bookRows.reduce((sum, row) => sum + Number(row.interest || 0), 0);
         return { debit, credit, balance: debit - credit, interest, openingInterest, opening };
@@ -509,6 +570,7 @@ function App() {
   });
   const accountCategories = Array.from(new Set([...defaultCategories, ...accounts.map((account) => account.category).filter(Boolean)])).sort();
   const activeAccount = selectedAccount(accounts, selectedId);
+  const activeSummary = summaryRows.find((row) => row.accountId === selectedId);
   const accountForLedger = (ledgerId?: number) => accounts.find((account) => account.ledgerId === ledgerId);
   const oppositeLedgers = ledgers
     .filter((ledger) => ledger.id !== activeAccount?.ledgerId)
@@ -607,6 +669,19 @@ function App() {
                   <i>To</i>
                   <strong>{entry.side === 'Cr' ? activeAccount?.name : oppositeLedgers.find((ledger) => ledger.id === entry.counterLedgerId)?.name || 'Opposite account'} A/c</strong>
                 </div>
+                {activeSummary && (
+                  <div className="interest-post-panel">
+                    <dl>
+                      <div><dt>Principal</dt><dd>{amount(activeSummary.totalBalance)}</dd></div>
+                      <div><dt>Previous Interest</dt><dd>{amount(activeSummary.previousYearInterest)}</dd></div>
+                      <div><dt>Current Interest</dt><dd>{amount(activeSummary.currentYearInterest)}</dd></div>
+                      <div><dt>Total Interest</dt><dd>{amount(activeSummary.interest)}</dd></div>
+                    </dl>
+                    <button className="secondary-button" onClick={postManualInterest} disabled={Math.abs(Number(activeSummary.interest || 0)) < 0.005}>
+                      <FileText size={16} /> Pass Interest Entry
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
             {accountEditorOpen && (
@@ -747,7 +822,7 @@ function App() {
             <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="bd-title" onMouseDown={(event) => event.stopPropagation()}>
               <div className="confirm-icon" style={{ backgroundColor: 'var(--accent-soft)', color: 'var(--accent)' }}><RefreshCw size={21} /></div>
               <h2 id="bd-title">Perform Balance B/D?</h2>
-              <p>This will consolidate all entries for <strong>{activeAccount?.name}</strong> up to <strong>{dateText(asOf)}</strong> (including principal and interest) into a single opening balance.</p>
+              <p>This will consolidate principal entries for <strong>{activeAccount?.name}</strong> up to <strong>{dateText(asOf)}</strong> into Balance B/D. Interest is not added to opening balance.</p>
               <p style={{ fontSize: '12px', color: 'var(--muted)', marginTop: '6px' }}>
                 <strong>IMPORTANT:</strong> A statement PDF will be saved first to preserve transaction history. You must select a file path to proceed.
               </p>
@@ -796,6 +871,7 @@ function BrandIdentity({ compact = false }: { compact?: boolean }) {
 
 function WindowTopBar() {
   const [isFullscreen, setIsFullscreen] = useState(true);
+  const [syncing, setSyncing] = useState(false);
 
   useEffect(() => {
     window.windowControls.getState().then((state) => setIsFullscreen(state.isFullscreen));
@@ -821,11 +897,27 @@ function WindowTopBar() {
     }
   };
 
+  const syncNow = async () => {
+    setSyncing(true);
+    try {
+      const settings = await window.accounting.getCloudSyncSettings();
+      if (!settings.enabled) throw new Error('Cloud sync is not enabled.');
+      if (!settings.authToken?.trim()) throw new Error('Generate or enter a cloud sync access key first.');
+      const result = await window.accounting.syncDatabaseToCloud();
+      toast.success(result.message);
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   return (
     <div className={`window-hover-zone ${isFullscreen ? 'is-fullscreen' : 'is-windowed'}`}>
       <div className="window-top-bar">
         <span className="window-title-brand"><img src="assets/jj-accounting-mark.svg" alt="" />{appName}</span>
         <div className="window-actions">
+          <button type="button" title="Sync to cloud" className="window-sync" disabled={syncing} onClick={syncNow}><RefreshCw size={16} className={syncing ? 'spin-icon' : undefined} /></button>
           <button type="button" title="Minimize" onClick={() => window.windowControls.minimize()}><Minimize2 size={16} /></button>
           <button type="button" title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'} onClick={toggleFullscreen}>{isFullscreen ? <Shrink size={16} /> : <Maximize2 size={16} />}</button>
           <button type="button" title="Close" className="window-close" onClick={() => window.windowControls.close()}><X size={17} /></button>
@@ -944,7 +1036,7 @@ function AllAccounts({ accounts, openAccount, deleteAccount, compact = false }: 
     <div className="simple-panel">
       <h2>{compact ? 'Recent Accounts' : 'All Accounts'}</h2>
       <table className="plain-table">
-        <thead><tr><th>Name</th><th>Category</th><th>Phone</th><th>Opening Date</th><th>Opening</th><th>Interest %</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Category</th><th>Phone</th><th>Opening Date</th><th>Interest %</th><th></th></tr></thead>
         <tbody>
           {accounts.map((account) => (
             <tr key={account.id}>
@@ -952,7 +1044,7 @@ function AllAccounts({ accounts, openAccount, deleteAccount, compact = false }: 
               <td>{account.category}</td>
               <td>{account.phone}</td>
               <td>{dateText(account.openingDate)}</td>
-              <td>{(account.openingKBalance || account.openingPBalance) ? `K: ${account.openingKType} ${amount(account.openingKBalance)} / P: ${account.openingPType} ${amount(account.openingPBalance)}` : '—'}</td>
+              {/* <td>{(account.openingKBalance || account.openingPBalance) ? `K: ${account.openingKType} ${amount(account.openingKBalance)} / P: ${account.openingPType} ${amount(account.openingPBalance)}` : '—'}</td> */}
               <td>{account.defaultRate}</td>
               <td className="number-cell action-cell">{!compact && <button className="small-button icon-action" title="Open account" onClick={() => account.id && openAccount(account.id)}><Eye size={15} /></button>}</td>
             </tr>
@@ -1235,11 +1327,23 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
     totalExpenses += amt;
   }
 
+  const totalInterestPayable = interestPayable.reduce((sum, row) => sum + Number(row.totalInterest || 0), 0);
+  if (totalInterestPayable > 0.005) {
+    leftRows.push({ type: 'detail', label: 'Accrued Interest Payable', amount: totalInterestPayable });
+    totalExpenses += totalInterestPayable;
+  }
+
   for (const r of incomeRows) {
     const amt = r.credit - r.debit;
     if (Math.abs(amt) < 0.005) continue;
     rightRows.push({ type: 'detail', label: r.ledgerName, amount: amt });
     totalIncome += amt;
+  }
+
+  const totalInterestReceivable = interestReceivable.reduce((sum, row) => sum + Number(row.totalInterest || 0), 0);
+  if (totalInterestReceivable > 0.005) {
+    rightRows.push({ type: 'detail', label: 'Accrued Interest Receivable', amount: totalInterestReceivable });
+    totalIncome += totalInterestReceivable;
   }
 
   const netProfit = totalIncome - totalExpenses;
@@ -1275,7 +1379,37 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
     );
   };
 
-  const hasInterestDetails = interestReceivable.length > 0 || interestPayable.length > 0;
+  const payableInterestRows = interestPayable.length > 0
+    ? interestPayable
+    : totalInterestPayable > 0.005
+      ? [{
+          accountId: -1,
+          accountName: 'Total Interest Payable',
+          category: '',
+          kBalance: 0,
+          pBalance: 0,
+          totalBalance: 0,
+          kInterest: 0,
+          pInterest: 0,
+          totalInterest: totalInterestPayable
+        }]
+      : [];
+  const receivableInterestRows = interestReceivable.length > 0
+    ? interestReceivable
+    : totalInterestReceivable > 0.005
+      ? [{
+          accountId: -2,
+          accountName: 'Total Interest Receivable',
+          category: '',
+          kBalance: 0,
+          pBalance: 0,
+          totalBalance: 0,
+          kInterest: 0,
+          pInterest: 0,
+          totalInterest: totalInterestReceivable
+        }]
+      : [];
+  const hasInterestDetails = receivableInterestRows.length > 0 || payableInterestRows.length > 0;
 
   return (
     <div className="simple-panel report-panel">
@@ -1351,25 +1485,18 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
                   <span>Interest Payable</span>
                   <small>on Loans Taken</small>
                 </div>
-                {interestPayable.length > 0 ? (
+                {payableInterestRows.length > 0 ? (
                   <table className="plain-table">
                     <thead>
                       <tr>
                         <th>Account</th>
-                        <th className="number-cell">K</th>
-                        <th className="number-cell">P</th>
                         <th className="number-cell">Total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {interestPayable.map((r) => (
+                      {payableInterestRows.map((r) => (
                         <tr key={r.accountId}>
-                          <td className="ledger-cell">
-                            {r.accountName}
-                            <small className="interest-cat-badge">{r.category}</small>
-                          </td>
-                          <td className="number-cell">{amount(r.kInterest)}</td>
-                          <td className="number-cell">{amount(r.pInterest)}</td>
+                          <td className="ledger-cell">{r.accountName}</td>
                           <td className="number-cell interest-total-cell">{amount(r.totalInterest)}</td>
                         </tr>
                       ))}
@@ -1377,9 +1504,7 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
                     <tfoot>
                       <tr>
                         <td><strong>Total Payable</strong></td>
-                        <td className="number-cell"><strong>{amount(interestPayable.reduce((s, r) => s + r.kInterest, 0))}</strong></td>
-                        <td className="number-cell"><strong>{amount(interestPayable.reduce((s, r) => s + r.pInterest, 0))}</strong></td>
-                        <td className="number-cell interest-total-cell"><strong>{amount(interestPayable.reduce((s, r) => s + r.totalInterest, 0))}</strong></td>
+                        <td className="number-cell interest-total-cell"><strong>{amount(totalInterestPayable)}</strong></td>
                       </tr>
                     </tfoot>
                   </table>
@@ -1394,25 +1519,18 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
                   <span>Interest Receivable</span>
                   <small>on Loans Given</small>
                 </div>
-                {interestReceivable.length > 0 ? (
+                {receivableInterestRows.length > 0 ? (
                   <table className="plain-table">
                     <thead>
                       <tr>
                         <th>Account</th>
-                        <th className="number-cell">K</th>
-                        <th className="number-cell">P</th>
                         <th className="number-cell">Total</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {interestReceivable.map((r) => (
+                      {receivableInterestRows.map((r) => (
                         <tr key={r.accountId}>
-                          <td className="ledger-cell">
-                            {r.accountName}
-                            <small className="interest-cat-badge">{r.category}</small>
-                          </td>
-                          <td className="number-cell">{amount(r.kInterest)}</td>
-                          <td className="number-cell">{amount(r.pInterest)}</td>
+                          <td className="ledger-cell">{r.accountName}</td>
                           <td className="number-cell interest-total-cell">{amount(r.totalInterest)}</td>
                         </tr>
                       ))}
@@ -1420,9 +1538,7 @@ function ProfitLoss({ data, book, asOf, onRefresh }: {
                     <tfoot>
                       <tr>
                         <td><strong>Total Receivable</strong></td>
-                        <td className="number-cell"><strong>{amount(interestReceivable.reduce((s, r) => s + r.kInterest, 0))}</strong></td>
-                        <td className="number-cell"><strong>{amount(interestReceivable.reduce((s, r) => s + r.pInterest, 0))}</strong></td>
-                        <td className="number-cell interest-total-cell"><strong>{amount(interestReceivable.reduce((s, r) => s + r.totalInterest, 0))}</strong></td>
+                        <td className="number-cell interest-total-cell"><strong>{amount(totalInterestReceivable)}</strong></td>
                       </tr>
                     </tfoot>
                   </table>
@@ -1583,6 +1699,7 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
   const [balanceHistory, setBalanceHistory] = useState<any[]>([]);
   const [yearArchives, setYearArchives] = useState<FinancialYearArchive[]>([]);
   const [busy, setBusy] = useState(false);
+  const [printTarget, setPrintTarget] = useState<FinancialYearArchive | null>(null);
 
   const fetchHistory = async () => {
     setBusy(true);
@@ -1614,8 +1731,20 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
     }
   };
 
+  const printDocument = async (filePath: string, orientation: 'portrait' | 'landscape') => {
+    try {
+      setPrintTarget(null);
+      const printed = await window.accounting.printPDFFile(filePath, orientation);
+      if (printed) toast.success('Print dialog opened');
+      else toast.error('File not found or could not be printed.');
+    } catch (error: any) {
+      toast.error(error.message);
+    }
+  };
+
   const undoYearClose = async (archive: FinancialYearArchive) => {
-    const confirmed = window.confirm(`Undo financial year close ${archive.fromFinancialYear} -> ${archive.toFinancialYear}?\n\nThis restores the database backup from before the year was shifted. Any entries added after opening ${archive.toFinancialYear} will be removed.`);
+    const confirmed = window.confirm('Are you sure you want to undo the financial year change? This will restore all data to the previous financial year state.');
+    restoreKeyboardFocus();
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -1628,6 +1757,7 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
       toast.error(error.message);
     } finally {
       setBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -1684,6 +1814,11 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
                           {row.documentPath ? (
                             <button className="small-button icon-action" title="Open archive PDF" onClick={() => openDocument(row.documentPath!)}>
                               <Eye size={15} />
+                            </button>
+                          ) : null}
+                          {row.documentPath ? (
+                            <button className="small-button icon-action" title="Print archive PDF" onClick={() => setPrintTarget(row)}>
+                              <Printer size={15} />
                             </button>
                           ) : null}
                           <button className="small-button icon-action danger-small" title="Undo financial year close" disabled={busy || !row.backupPath} onClick={() => undoYearClose(row)}>
@@ -1757,6 +1892,24 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
           </section>
         </div>
       )}
+      {printTarget?.documentPath && (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={() => setPrintTarget(null)}>
+          <div className="confirm-dialog print-options-dialog" role="dialog" aria-modal="true" aria-labelledby="print-title" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="confirm-icon" style={{ backgroundColor: 'var(--accent-soft)', color: 'var(--accent)' }}><Printer size={21} /></div>
+            <h2 id="print-title">Print financial year archive</h2>
+            <p>Choose page orientation for {printTarget.fromFinancialYear}. The printer dialog will open next.</p>
+            <div className="print-options-grid">
+              <button className="secondary-button" type="button" onClick={() => printDocument(printTarget.documentPath!, 'portrait')}>
+                <Printer size={16} /> Portrait
+              </button>
+              <button className="primary-button" type="button" onClick={() => printDocument(printTarget.documentPath!, 'landscape')}>
+                <Printer size={16} /> Landscape
+              </button>
+            </div>
+            <button className="secondary-button" type="button" onClick={() => setPrintTarget(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1764,27 +1917,54 @@ function RecordsArchiveView({ onCompanyRestored }: { onCompanyRestored: (company
 function FirmDetailsView({ company, onSaved }: { company: Company | null; onSaved: (company: Company) => void }) {
   const [form, setForm] = useState<Company>(company ?? defaultCompany());
   const [busy, setBusy] = useState(false);
+  const [manualCloseDate, setManualCloseDate] = useState(today());
 
-  useEffect(() => setForm(company ?? defaultCompany()), [company]);
+  useEffect(() => {
+    setForm(company ?? defaultCompany());
+    setManualCloseDate(parseFinancialYear(company?.financialYear)?.end || today());
+  }, [company]);
+
+  const previousYear = company?.financialYear?.trim();
+  const nextYear = form.financialYear.trim();
+  const suggestedNextYear = nextFinancialYearLabel(previousYear);
+  const isYearChange = Boolean(company?.id && previousYear && nextYear && previousYear.toLowerCase() !== nextYear.toLowerCase());
+  const nextOpeningDate = addDays(manualCloseDate, 1);
 
   const saveFirm = async (event: React.FormEvent) => {
     event.preventDefault();
-    const previousYear = company?.financialYear?.trim();
-    const nextYear = form.financialYear.trim();
-    const isYearChange = Boolean(company?.id && previousYear && nextYear && previousYear.toLowerCase() !== nextYear.toLowerCase());
     if (isYearChange) {
-      const confirmed = window.confirm(`Close financial year ${previousYear} and open ${nextYear}?\n\nJJ Accounting will save old-year reports, ledger statements, a JSON data snapshot, and a database backup before carrying balances forward.`);
+      const confirmed = window.confirm(`Financial year can be changed only with Manual Financial Year Change.\n\nSave other firm details now and keep financial year ${previousYear}?`);
+      restoreKeyboardFocus();
       if (!confirmed) return;
     }
     setBusy(true);
     try {
-      const saved = isYearChange ? (await window.accounting.closeFinancialYear(form)).company : await window.accounting.saveCompany(form);
+      const saved = await window.accounting.saveCompany(isYearChange ? { ...form, financialYear: previousYear || form.financialYear } : form);
       onSaved(saved);
-      toast.success(isYearChange ? 'Financial year archived and opened' : 'Firm details updated');
+      toast.success('Firm details updated');
     } catch (error: any) {
       toast.error(error.message);
     } finally {
       setBusy(false);
+      restoreKeyboardFocus();
+    }
+  };
+
+  const changeFinancialYearManually = async () => {
+    if (!isYearChange || !previousYear || !nextYear) return;
+    const confirmed = window.confirm(`Are you sure you want to change financial year?\n\nClose ${previousYear} on ${dateText(manualCloseDate)} and open ${nextYear} from ${dateText(nextOpeningDate)}.\n\nPrevious interest will be stored separately as PV-INTEREST. No interest transaction will be posted automatically.`);
+    restoreKeyboardFocus();
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const result = await window.accounting.closeFinancialYear(form, manualCloseDate);
+      onSaved(result.company);
+      toast.success(`Financial year opened from ${dateText(nextOpeningDate)}`);
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -1805,8 +1985,28 @@ function FirmDetailsView({ company, onSaved }: { company: Company | null; onSave
         <TextInput label="Email" value={form.email} onChange={(value) => setForm({ ...form, email: value })} />
         <TextInput label="GSTIN" value={form.gstin} onChange={(value) => setForm({ ...form, gstin: value.toUpperCase() })} />
         <TextInput label="Financial year" value={form.financialYear} onChange={(value) => setForm({ ...form, financialYear: value })} />
+        <DateInput label="Financial year close date" value={manualCloseDate} onChange={setManualCloseDate} />
       </div>
-      <button className="primary-button" disabled={busy}><Save size={16} /> {busy ? 'Saving...' : 'Save Firm Details'}</button>
+      {company?.id && previousYear && (
+        <div className="financial-year-helper">
+          <div>
+            <strong>Change Financial Year</strong>
+            <span>Current FY: {previousYear}. New FY opens from {dateText(nextOpeningDate)} after closing.</span>
+          </div>
+          <button className="secondary-button" type="button" disabled={busy || !suggestedNextYear} onClick={() => setForm({ ...form, financialYear: suggestedNextYear })}>
+            <RefreshCw size={16} /> Use Next FY
+          </button>
+        </div>
+      )}
+      {isYearChange && <p className="muted" style={{ marginTop: 0 }}>Change Financial Year will save previous reports, carry forward principal only, and show stored interest as read-only PV-INTEREST.</p>}
+      <div className="license-actions">
+        <button className="primary-button" disabled={busy}><Save size={16} /> {busy ? 'Saving...' : 'Save Firm Details'}</button>
+        {isYearChange && (
+          <button className="secondary-button" type="button" disabled={busy || !manualCloseDate} onClick={changeFinancialYearManually}>
+            <RefreshCw size={16} /> Change Financial Year
+          </button>
+        )}
+      </div>
     </form>
   );
 }
@@ -1878,6 +2078,7 @@ function CloudSyncView() {
   const [settings, setSettings] = useState<CloudSyncSettings>({ enabled: false, authToken: '' });
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [generatingKey, setGeneratingKey] = useState(false);
 
   useEffect(() => {
     window.accounting.getCloudSyncSettings().then(setSettings).catch((error) => toast.error(error.message));
@@ -1911,6 +2112,32 @@ function CloudSyncView() {
     }
   };
 
+  const generateAccessKey = async () => {
+    if (typeof window.accounting.generateCloudAccessKey !== 'function') {
+      toast.error('Please restart JJ Accounting once to load the new Cloud Sync key generator.');
+      return;
+    }
+    setGeneratingKey(true);
+    try {
+      const nextSettings = await window.accounting.generateCloudAccessKey(settings);
+      setSettings(nextSettings);
+      toast.success('New website access key generated. Old keys are now invalid.');
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setGeneratingKey(false);
+    }
+  };
+
+  const copyAccessKey = async () => {
+    try {
+      await navigator.clipboard.writeText(settings.authToken);
+      toast.success('Access key copied');
+    } catch {
+      toast.error('Could not copy access key.');
+    }
+  };
+
   const canSync = settings.enabled && settings.authToken.trim().length >= 8;
 
   return (
@@ -1928,19 +2155,22 @@ function CloudSyncView() {
           <span>{settings.enabled ? 'Cloud sync enabled' : 'Cloud sync disabled'}</span>
         </label>
         <label className="field">
-          <span>Access key <small style={{ color: 'var(--muted)', fontWeight: 400 }}>(generated on your website dashboard)</small></span>
+          <span>Access key <small style={{ color: 'var(--muted)', fontWeight: 400 }}>(generated by this application)</small></span>
           <div className="cloud-password-row">
-            <input type="text" value={settings.authToken} onChange={(event) => setSettings((current) => ({ ...current, authToken: event.target.value }))} autoComplete="off" placeholder="Paste the key from your website" />
+            <input type="text" value={settings.authToken} onChange={(event) => setSettings((current) => ({ ...current, authToken: event.target.value }))} autoComplete="off" placeholder="Generate a key for this business" />
           </div>
         </label>
       </div>
+      <p className="muted" style={{ marginTop: 0 }}>Use this one active key to open the website dashboard in any browser. Generating a new key for this business invalidates the old key.</p>
       <div className="cloud-sync-status">
         <div><dt>Last sync</dt><dd>{settings.lastSyncedAt ? dateTimeText(settings.lastSyncedAt) : 'Not synced yet'}</dd></div>
         <div><dt>Status</dt><dd>{settings.lastSyncMessage || 'Ready'}</dd></div>
       </div>
       <div className="license-actions">
-        <button className="primary-button" disabled={busy || syncing}><Save size={16} /> {busy ? 'Saving...' : 'Save Settings'}</button>
-        <button className="secondary-button" type="button" onClick={syncNow} disabled={busy || syncing || !canSync}><RefreshCw size={16} /> {syncing ? 'Syncing...' : 'Sync Now'}</button>
+        <button className="primary-button" disabled={busy || syncing || generatingKey}><Save size={16} /> {busy ? 'Saving...' : 'Save Settings'}</button>
+        <button className="secondary-button" type="button" onClick={generateAccessKey} disabled={busy || syncing || generatingKey}><KeyRound size={16} /> {generatingKey ? 'Generating...' : settings.authToken ? 'Generate New Key' : 'Generate Key'}</button>
+        <button className="secondary-button" type="button" onClick={copyAccessKey} disabled={!settings.authToken || busy || syncing || generatingKey}><KeyRound size={16} /> Copy Key</button>
+        <button className="secondary-button" type="button" onClick={syncNow} disabled={busy || syncing || generatingKey || !canSync}><RefreshCw size={16} /> {syncing ? 'Syncing...' : 'Sync Now'}</button>
       </div>
     </form>
   );
@@ -2074,18 +2304,22 @@ function BackupView({ dbPath }: { dbPath: string }) {
   };
 
   const restoreBackup = async () => {
-    if (!confirm('Restore a backup? Your current data will be replaced. A safety copy will be created automatically.')) return;
+    const confirmed = confirm('Restore a backup? Your current data will be replaced. A safety copy will be created automatically.');
+    restoreKeyboardFocus();
+    if (!confirmed) return;
     setBusy(true);
     try {
       const result = await window.accounting.restoreBackup();
       if (result.ok) {
         alert('Backup restored successfully. The application will now reload. Sign in using the password from that backup.');
+        restoreKeyboardFocus();
         window.location.reload();
       }
     } catch (error: any) {
       toast.error(error.message);
     } finally {
       setBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -2107,6 +2341,7 @@ function BackupView({ dbPath }: { dbPath: string }) {
     if (busy) return;
     setResetDialogOpen(false);
     setResetConfirmation('');
+    restoreKeyboardFocus();
   };
 
   const resetApp = async (event: React.FormEvent) => {
@@ -2120,12 +2355,14 @@ function BackupView({ dbPath }: { dbPath: string }) {
       const ok = await window.accounting.resetDatabase();
       if (ok) {
         alert('JJ Accounting has been reset. The application will now reload to the first setup screen.');
+        restoreKeyboardFocus();
         window.location.reload();
       }
     } catch (error: any) {
       toast.error(error.message);
     } finally {
       setBusy(false);
+      restoreKeyboardFocus();
     }
   };
 
@@ -2187,18 +2424,23 @@ function AccountSheet({ account, rows, zoom, showDetails, book, asOf, editMode, 
     const openingType = book === 'K' ? account?.openingKType : account?.openingPType;
     const debit = bookRows.filter((row) => row.side === 'Dr').reduce((sum, row) => sum + Number(row.amount || 0), openingType !== 'Cr' ? opening : 0);
     const credit = bookRows.filter((row) => row.side === 'Cr').reduce((sum, row) => sum + Number(row.amount || 0), openingType === 'Cr' ? opening : 0);
-    const openingDays = daysBetweenDates(account?.openingDate, asOf);
+    const interestStartDate = maxDate(account?.openingDate, account?.currentInterestStartDate);
+    const openingDays = daysBetweenDates(interestStartDate, asOf);
     const openingInterest = opening * Number(account?.defaultRate || 0) / 100 / 30 * openingDays * (openingType === 'Cr' ? -1 : 1);
-    const interest = openingInterest + bookRows.reduce((sum, row) => sum + Number(row.interest || 0), 0);
-    return { debit, credit, balance: debit - credit, interest, openingInterest };
+    const currentYearInterest = openingInterest + bookRows.reduce((sum, row) => sum + Number(row.interest || 0), 0);
+    return { debit, credit, balance: debit - credit, interest: currentYearInterest, currentYearInterest, previousYearInterest: 0, openingInterest };
   };
   const k = bookTotal('K');
   const p = bookTotal('P');
+  const previousYearInterest = Number(account?.previousYearInterest || 0);
+  const currentYearInterest = k.currentYearInterest + p.currentYearInterest;
   const totals = {
     debit: k.debit + p.debit,
     credit: k.credit + p.credit,
     balance: k.balance + p.balance,
-    interest: k.interest + p.interest
+    interest: currentYearInterest + previousYearInterest,
+    currentYearInterest,
+    previousYearInterest
   };
   const displayed = book === 'K' ? k : book === 'P' ? p : totals;
 
@@ -2218,27 +2460,28 @@ function AccountSheet({ account, rows, zoom, showDetails, book, asOf, editMode, 
       <div className="worksheet-summary">
         {book === 'K' && <SummaryTile title="Khacha" debit={k.debit} credit={k.credit} balance={k.balance} interest={k.interest} />}
         {book === 'P' && <SummaryTile title="Packa" debit={p.debit} credit={p.credit} balance={p.balance} interest={p.interest} />}
-        {book === 'Combined' && <SummaryTile title="Combined" debit={totals.debit} credit={totals.credit} balance={totals.balance} interest={totals.interest} />}
+        {book === 'Combined' && <CustomerDataCard principal={totals.balance} previousInterest={previousYearInterest} currentInterest={currentYearInterest} totalInterest={totals.interest} />}
       </div>
 
       <div className="book-ledger-stack">
         {book === 'K' && <BookLedger title="Khacha" book="K" rows={rows} totals={k} showDetails={showDetails} openingBalance={account?.openingKBalance ?? 0} openingType={account?.openingKType ?? 'Dr'} openingDate={account?.openingDate ?? ''} openingInterest={k.openingInterest} editMode={editMode} onEditTransaction={onEditTransaction} onDeleteTransaction={onDeleteTransaction} />}
         {book === 'P' && <BookLedger title="Packa" book="P" rows={rows} totals={p} showDetails={showDetails} openingBalance={account?.openingPBalance ?? 0} openingType={account?.openingPType ?? 'Dr'} openingDate={account?.openingDate ?? ''} openingInterest={p.openingInterest} editMode={editMode} onEditTransaction={onEditTransaction} onDeleteTransaction={onDeleteTransaction} />}
-        {book === 'Combined' && <BookLedger title="Account Ledger" book="Combined" rows={rows} totals={totals} showDetails={showDetails} openingBalance={Math.abs((account?.openingKBalance ?? 0) * (account?.openingKType === 'Cr' ? -1 : 1) + (account?.openingPBalance ?? 0) * (account?.openingPType === 'Cr' ? -1 : 1))} openingType={((account?.openingKBalance ?? 0) * (account?.openingKType === 'Cr' ? -1 : 1) + (account?.openingPBalance ?? 0) * (account?.openingPType === 'Cr' ? -1 : 1)) < 0 ? 'Cr' : 'Dr'} openingDate={account?.openingDate ?? ''} openingInterest={k.openingInterest + p.openingInterest} editMode={editMode} onEditTransaction={onEditTransaction} onDeleteTransaction={onDeleteTransaction} />}
+        {book === 'Combined' && <BookLedger title="Account Ledger" book="Combined" rows={rows} totals={totals} showDetails={showDetails} openingBalance={Math.abs((account?.openingKBalance ?? 0) * (account?.openingKType === 'Cr' ? -1 : 1) + (account?.openingPBalance ?? 0) * (account?.openingPType === 'Cr' ? -1 : 1))} openingType={((account?.openingKBalance ?? 0) * (account?.openingKType === 'Cr' ? -1 : 1) + (account?.openingPBalance ?? 0) * (account?.openingPType === 'Cr' ? -1 : 1)) < 0 ? 'Cr' : 'Dr'} openingDate={account?.openingDate ?? ''} openingInterest={k.openingInterest + p.openingInterest} previousInterest={previousYearInterest} previousInterestDate={account?.currentInterestStartDate ?? account?.openingDate ?? ''} editMode={editMode} onEditTransaction={onEditTransaction} onDeleteTransaction={onDeleteTransaction} />}
       </div>
     </div>
   );
 }
 
-function BookLedger({ title, book, rows, totals, showDetails, openingBalance, openingType, openingDate, openingInterest, editMode, onEditTransaction, onDeleteTransaction }: { title: string; book: ReportBook; rows: LoanStatementRow[]; totals: { debit: number; credit: number; balance: number; interest: number }; showDetails: boolean; openingBalance: number; openingType: 'Dr' | 'Cr'; openingDate: string; openingInterest: number; editMode: boolean; onEditTransaction: (transaction: LoanStatementRow) => void; onDeleteTransaction: (transaction: LoanStatementRow) => void }) {
+function BookLedger({ title, book, rows, totals, showDetails, openingBalance, openingType, openingDate, openingInterest, previousInterest = 0, previousInterestDate, editMode, onEditTransaction, onDeleteTransaction }: { title: string; book: ReportBook; rows: LoanStatementRow[]; totals: { debit: number; credit: number; balance: number; interest: number }; showDetails: boolean; openingBalance: number; openingType: 'Dr' | 'Cr'; openingDate: string; openingInterest: number; previousInterest?: number; previousInterestDate?: string; editMode: boolean; onEditTransaction: (transaction: LoanStatementRow) => void; onDeleteTransaction: (transaction: LoanStatementRow) => void }) {
   const bookRows = book === 'Combined' ? rows : rows.filter((row) => row.book === book);
   const debitRows = bookRows.filter((row) => row.side === 'Dr').sort((a, b) => `${a.date}-${a.id ?? 0}`.localeCompare(`${b.date}-${b.id ?? 0}`));
   const creditRows = bookRows.filter((row) => row.side === 'Cr').sort((a, b) => `${a.date}-${a.id ?? 0}`.localeCompare(`${b.date}-${b.id ?? 0}`));
-  const debitEntries = [...(openingBalance > 0 && openingType === 'Dr' ? [{ opening: true as const }] : []), ...debitRows.map((row) => ({ row }))];
-  const creditEntries = [...(openingBalance > 0 && openingType === 'Cr' ? [{ opening: true as const }] : []), ...creditRows.map((row) => ({ row }))];
+  const pvDebitEntries = previousInterest > 0.005 ? [{ previousInterest: true as const }] : [];
+  const pvCreditEntries = previousInterest < -0.005 ? [{ previousInterest: true as const }] : [];
+  const debitEntries = [...pvDebitEntries, ...(openingBalance > 0 && openingType === 'Dr' ? [{ opening: true as const }] : []), ...debitRows.map((row) => ({ row }))];
+  const creditEntries = [...pvCreditEntries, ...(openingBalance > 0 && openingType === 'Cr' ? [{ opening: true as const }] : []), ...creditRows.map((row) => ({ row }))];
   const maxRows = Math.max(debitEntries.length, creditEntries.length, 5);
-  const rowDetail = (row?: LoanStatementRow) => showDetails && row ? `${row.days ? `${row.days} days` : ''}${row.narration ? `${row.days ? ' / ' : ''}${row.narration}` : ''}` : '';
-  const particulars = (row?: LoanStatementRow) => showDetails && row ? row.counterLedgerName || '' : '';
+  const particulars = (row?: LoanStatementRow) => row?.counterLedgerName || '';
 
   return (
     <section className="book-ledger">
@@ -2254,36 +2497,36 @@ function BookLedger({ title, book, rows, totals, showDetails, openingBalance, op
               <th colSpan={4} className="ledger-side-title credit-title">Credit Side (Cr.)</th>
             </tr>
             <tr>
-              <th>Date</th><th>Particulars</th><th className="number-cell">Amount</th><th className="number-cell">Interest</th>
-              <th>Date</th><th>Particulars</th><th className="number-cell">Amount</th><th className="number-cell">Interest</th>
+              <th>Date</th><th>Opposite A/c</th><th className="number-cell">Amount</th><th className="number-cell">Interest</th>
+              <th>Date</th><th>Opposite A/c</th><th className="number-cell">Amount</th><th className="number-cell">Interest</th>
             </tr>
           </thead>
           <tbody>
-            {(bookRows.length || openingBalance > 0) ? Array.from({ length: maxRows }).map((_, index) => {
+            {(bookRows.length || openingBalance > 0 || Math.abs(previousInterest) > 0.005) ? Array.from({ length: maxRows }).map((_, index) => {
               const debitEntry = debitEntries[index];
               const creditEntry = creditEntries[index];
               const debit = debitEntry && 'row' in debitEntry ? debitEntry.row : undefined;
               const credit = creditEntry && 'row' in creditEntry ? creditEntry.row : undefined;
               const debitOpening = Boolean(debitEntry && 'opening' in debitEntry);
               const creditOpening = Boolean(creditEntry && 'opening' in creditEntry);
+              const debitPv = Boolean(debitEntry && 'previousInterest' in debitEntry);
+              const creditPv = Boolean(creditEntry && 'previousInterest' in creditEntry);
               return (
                 <tr key={index}>
-                  <td>{debitOpening ? dateText(openingDate) : dateText(debit?.date)}</td>
+                  <td>{debitPv ? dateText(previousInterestDate) : debitOpening ? dateText(openingDate) : dateText(debit?.date)}</td>
                   <td>
-                    {debitOpening ? <strong>Opening Balance</strong> : particulars(debit)}
-                    {rowDetail(debit) && <span className="worksheet-detail">{rowDetail(debit)}</span>}
+                    {debitPv ? <strong>PV-INTEREST</strong> : debitOpening ? <strong>Opening Balance</strong> : particulars(debit)}
                     {debit && editMode && <span className="transaction-actions"><button title="Edit transaction" onClick={() => onEditTransaction(debit)}><Pencil size={13} /></button><button className="delete" title="Delete transaction" onClick={() => onDeleteTransaction(debit)}><Trash2 size={13} /></button></span>}
                   </td>
                   <td className="number-cell">{debitOpening ? amount(openingBalance) : debit ? amount(debit.amount) : ''}</td>
-                  <td className="number-cell">{debitOpening ? amount(Math.abs(openingInterest)) : debit ? amount(debit.interest) : ''}</td>
-                  <td>{creditOpening ? dateText(openingDate) : dateText(credit?.date)}</td>
+                  <td className="number-cell">{debitPv ? amount(Math.abs(previousInterest)) : debitOpening ? amount(Math.abs(openingInterest)) : debit ? amount(debit.interest) : ''}</td>
+                  <td>{creditPv ? dateText(previousInterestDate) : creditOpening ? dateText(openingDate) : dateText(credit?.date)}</td>
                   <td>
-                    {creditOpening ? <strong>Opening Balance</strong> : particulars(credit)}
-                    {rowDetail(credit) && <span className="worksheet-detail">{rowDetail(credit)}</span>}
+                    {creditPv ? <strong>PV-INTEREST</strong> : creditOpening ? <strong>Opening Balance</strong> : particulars(credit)}
                     {credit && editMode && <span className="transaction-actions"><button title="Edit transaction" onClick={() => onEditTransaction(credit)}><Pencil size={13} /></button><button className="delete" title="Delete transaction" onClick={() => onDeleteTransaction(credit)}><Trash2 size={13} /></button></span>}
                   </td>
                   <td className="number-cell">{creditOpening ? amount(openingBalance) : credit ? amount(credit.amount) : ''}</td>
-                  <td className="number-cell">{creditOpening ? amount(Math.abs(openingInterest)) : credit ? amount(Math.abs(credit.interest || 0)) : ''}</td>
+                  <td className="number-cell">{creditPv ? amount(Math.abs(previousInterest)) : creditOpening ? amount(Math.abs(openingInterest)) : credit ? amount(Math.abs(credit.interest || 0)) : ''}</td>
                 </tr>
               );
             }) : <tr><td colSpan={8} className="empty-row">No {title} transactions yet</td></tr>}
@@ -2305,6 +2548,25 @@ function BookLedger({ title, book, rows, totals, showDetails, openingBalance, op
         </table>
       </div>
     </section>
+  );
+}
+
+function CustomerDataCard({ principal, previousInterest, currentInterest, totalInterest }: { principal: number; previousInterest: number; currentInterest: number; totalInterest: number }) {
+  const recoverable = principal + totalInterest;
+  return (
+    <div className="summary-tile customer-data-card">
+      <div>
+        <span>Customer Data Card</span>
+        <strong>{recoverable >= 0 ? 'Dr.' : 'Cr.'} {amount(Math.abs(recoverable))}</strong>
+      </div>
+      <dl>
+        <div><dt>Principal Outstanding</dt><dd>{amount(principal)}</dd></div>
+        <div><dt>Previous Year Interest</dt><dd>{amount(previousInterest)}</dd></div>
+        <div><dt>Current Year Interest</dt><dd>{amount(currentInterest)}</dd></div>
+        <div><dt>Total Interest</dt><dd>{amount(totalInterest)}</dd></div>
+        <div><dt>Grand Total Recoverable</dt><dd>{amount(recoverable)}</dd></div>
+      </dl>
+    </div>
   );
 }
 
@@ -2337,6 +2599,7 @@ function ViewTabs({ value, onChange }: { value: ReportBook; onChange: (value: Re
 }
 
 function ReportActions({ targetId, title }: { targetId: string; title: string }) {
+  const [printOrientationDialog, setPrintOrientationDialog] = useState(false);
   const getTarget = () => document.getElementById(targetId);
   const textOf = (element: Element | null | undefined) => element?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
   const exportExcel = () => {
@@ -2456,16 +2719,16 @@ function ReportActions({ targetId, title }: { targetId: string; title: string })
     doc.save(`${safeFileName(title)}.pdf`);
     toast.success('PDF exported');
   };
-  const printReport = () => {
+  const printReport = (orientation: 'portrait' | 'landscape') => {
     const target = getTarget();
     if (!target) return toast.error('Report is not ready yet.');
+    setPrintOrientationDialog(false);
     const popup = window.open('', '_blank', 'width=1100,height=800');
     if (!popup) return toast.error('Allow the print window to open.');
-    const ledgerPrint = targetId === 'account-report';
     const content = target.cloneNode(true) as HTMLElement;
-    if (ledgerPrint) content.querySelectorAll('.worksheet-summary, .balance-pill').forEach((element) => element.remove());
+    if (targetId === 'account-report') content.querySelectorAll('.worksheet-summary, .balance-pill').forEach((element) => element.remove());
     popup.document.write(`<!doctype html><html><head><title>${title}</title><style>
-      *{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;padding:10mm}h1{font-size:18px;text-align:center;margin:0 0 4mm}.worksheet{display:block}.worksheet-head{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:5mm;padding-bottom:3mm}.worksheet-head h2{margin:0;font-size:20px}.worksheet-head span{font-size:11px}.book-ledger{break-inside:avoid;margin-bottom:7mm}.book-ledger-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:2mm}.book-ledger-title h3{margin:0;font-size:15px}.book-ledger-title span{font-weight:bold}table{width:100%;border-collapse:collapse;margin-bottom:4mm;table-layout:fixed}th,td{border:1px solid #555;padding:4px 5px;text-align:left;font-size:10px;height:7mm}.ledger-side-title{text-align:center;font-size:12px;background:#eee}.number-cell{text-align:right}.worksheet-detail{display:block;font-size:8px;color:#555}tfoot td{font-weight:bold;background:#f3f3f3}button{display:none}@page{size:${ledgerPrint ? 'A4 landscape' : 'A4 portrait'};margin:8mm}
+      *{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;padding:10mm}h1{font-size:18px;text-align:center;margin:0 0 4mm}.worksheet{display:block}.worksheet-head{display:flex;justify-content:space-between;border-bottom:2px solid #111;margin-bottom:5mm;padding-bottom:3mm}.worksheet-head h2{margin:0;font-size:20px}.worksheet-head span{font-size:11px}.book-ledger{break-inside:avoid;margin-bottom:7mm}.book-ledger-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:2mm}.book-ledger-title h3{margin:0;font-size:15px}.book-ledger-title span{font-weight:bold}table{width:100%;border-collapse:collapse;margin-bottom:4mm;table-layout:fixed}th,td{border:1px solid #555;padding:4px 5px;text-align:left;font-size:10px;height:7mm}.ledger-side-title{text-align:center;font-size:12px;background:#eee}.number-cell{text-align:right}.worksheet-detail{display:block;font-size:8px;color:#555}tfoot td{font-weight:bold;background:#f3f3f3}button{display:none}@page{size:A4 ${orientation};margin:8mm}
     </style></head><body><h1>${title}</h1>${content.outerHTML}</body></html>`);
     popup.document.close();
     popup.focus();
@@ -2481,9 +2744,27 @@ function ReportActions({ targetId, title }: { targetId: string; title: string })
         <div className="export-menu-popover">
           <button type="button" onClick={(event) => { exportPdf(); closeMenu(event); }}><FileText size={17} /><span><strong>Export PDF</strong><small>Portable report document</small></span></button>
           <button type="button" onClick={(event) => { exportExcel(); closeMenu(event); }}><FileSpreadsheet size={17} /><span><strong>Export Excel</strong><small>Spreadsheet for editing</small></span></button>
-          <button type="button" onClick={(event) => { printReport(); closeMenu(event); }}><Printer size={17} /><span><strong>Print ledger</strong><small>Printer-ready format</small></span></button>
+          <button type="button" onClick={(event) => { setPrintOrientationDialog(true); closeMenu(event); }}><Printer size={17} /><span><strong>Print</strong><small>Choose page orientation</small></span></button>
         </div>
       </details>
+      {printOrientationDialog && (
+        <div className="dialog-backdrop" role="presentation" onMouseDown={() => setPrintOrientationDialog(false)}>
+          <div className="confirm-dialog print-options-dialog" role="dialog" aria-modal="true" aria-labelledby={`${targetId}-print-title`} onMouseDown={(event) => event.stopPropagation()}>
+            <div className="confirm-icon" style={{ backgroundColor: 'var(--accent-soft)', color: 'var(--accent)' }}><Printer size={21} /></div>
+            <h2 id={`${targetId}-print-title`}>Print report</h2>
+            <p>Choose page orientation for {title}.</p>
+            <div className="print-options-grid">
+              <button className="secondary-button" type="button" onClick={() => printReport('portrait')}>
+                <Printer size={16} /> Portrait
+              </button>
+              <button className="primary-button" type="button" onClick={() => printReport('landscape')}>
+                <Printer size={16} /> Landscape
+              </button>
+            </div>
+            <button className="secondary-button" type="button" onClick={() => setPrintOrientationDialog(false)}>Cancel</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

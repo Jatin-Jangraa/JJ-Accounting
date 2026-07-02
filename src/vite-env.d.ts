@@ -11,6 +11,7 @@ declare global {
       enterFullscreen(): void;
       exitFullscreen(): void;
       toggleFullscreen(): void;
+      focus(): void;
       getState(): Promise<{ isFullscreen: boolean }>;
       onFullscreenChange(callback: (isFullscreen: boolean) => void): () => void;
     };

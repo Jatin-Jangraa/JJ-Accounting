@@ -31,7 +31,7 @@ export interface AccountingApi {
   changePassword(currentPassword: string, nextPassword: string): Promise<boolean>;
   getCompany(): Promise<Company | null>;
   saveCompany(company: Company): Promise<Company>;
-  closeFinancialYear(company: Company): Promise<FinancialYearCloseResult>;
+  closeFinancialYear(company: Company, manualCloseDate?: string): Promise<FinancialYearCloseResult>;
   listFinancialYearArchives(): Promise<FinancialYearArchive[]>;
   undoFinancialYearClose(archiveId: number): Promise<BackupResult>;
   listLedgers(): Promise<Ledger[]>;
@@ -55,6 +55,7 @@ export interface AccountingApi {
   saveLoanTransaction(transaction: LoanTransaction): Promise<LoanTransaction>;
   updateLoanTransaction(transaction: LoanTransaction): Promise<LoanTransaction>;
   deleteLoanTransaction(id: number): Promise<boolean>;
+  postManualInterest(accountId: number, date: string): Promise<Voucher>;
   setLoanAccountPinned(id: number, pinned: boolean): Promise<boolean>;
   loanStatement(accountId: number, asOf?: string): Promise<LoanStatementRow[]>;
   lendingSummary(asOf?: string): Promise<LoanSummaryRow[]>;
@@ -66,6 +67,7 @@ export interface AccountingApi {
   getAutoBackup(): Promise<boolean>;
   getCloudSyncSettings(): Promise<CloudSyncSettings>;
   saveCloudSyncSettings(settings: CloudSyncSettings): Promise<CloudSyncSettings>;
+  generateCloudAccessKey(settings?: CloudSyncSettings): Promise<CloudSyncSettings>;
   syncDatabaseToCloud(): Promise<CloudSyncResult>;
   exportInvoicePdf(invoiceId: number): Promise<BackupResult>;
   showSaveDialog(defaultPath: string): Promise<any>;
@@ -75,6 +77,7 @@ export interface AccountingApi {
   getLatestBalanceBD(accountId: number): Promise<any>;
   listBalanceBDHistory(): Promise<any[]>;
   openPDFFile(filePath: string): Promise<boolean>;
+  printPDFFile(filePath: string, orientation?: 'portrait' | 'landscape'): Promise<boolean>;
   resetDatabase(): Promise<boolean>;
   getLicenseStatus(): Promise<LicenseStatus>;
   activateLicense(licenseKey: string): Promise<LicenseActivationResult>;
